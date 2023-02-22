@@ -1,4 +1,4 @@
-#![deny(warnings)]
+#![cfg_attr(debug_assertions, deny(warnings))]
 pub mod decompress_deflate;
 pub mod decompress_gzip;
 mod decompress_utils;
