@@ -37,11 +37,20 @@
  * corresponding ENOUGH number!
  */
 
+use std::time::Duration;
+
+use crate::bitstream::can_ensure;
+use crate::bitstream::BitStream;
+use crate::bitstream::MAX_ENSURE;
+use crate::decode_blocks::decode_dynamic_huffman_block;
+use crate::decode_blocks::decode_huffman_header;
+use crate::decode_blocks::decode_uncompressed_block;
+use crate::decode_blocks::load_static_huffman_block;
 use crate::decompress_utils::*;
 use crate::deflate_constants::*;
+use crate::unchecked::UncheckedArray;
 use crate::{DeflateInput, DeflateOutput, LibdeflateDecompressor, LibdeflateError};
 use nightly_quirks::branch_pred::unlikely;
-use std::mem::size_of;
 
 pub const PRECODE_TABLEBITS: usize = 7;
 pub const LITLEN_TABLEBITS: usize = 10;
@@ -94,9 +103,11 @@ macro_rules! safety_check {
 
 #[derive(Copy, Clone)]
 pub(crate) struct _DecStruct {
-    pub(crate) lens:
-        [LenType; DEFLATE_NUM_LITLEN_SYMS + DEFLATE_NUM_OFFSET_SYMS + DEFLATE_MAX_LENS_OVERRUN],
-    pub(crate) precode_decode_table: [u32; PRECODE_ENOUGH],
+    pub(crate) lens: UncheckedArray<
+        LenType,
+        { DEFLATE_NUM_LITLEN_SYMS + DEFLATE_NUM_OFFSET_SYMS + DEFLATE_MAX_LENS_OVERRUN },
+    >,
+    pub(crate) precode_decode_table: UncheckedArray<u32, PRECODE_ENOUGH>,
 }
 
 /*
@@ -105,173 +116,258 @@ pub(crate) struct _DecStruct {
  * target instruction sets.
  */
 
-pub(crate) fn deflate_decompress_template<I: DeflateInput, O: DeflateOutput>(
+#[inline(never)]
+fn process_instructions<O: DeflateOutput>(
+    instructions: &mut Vec<u16>,
+    output_stream: &mut O,
+) -> Result<(), LibdeflateError> {
+    // return Ok(());
+    let mut instr_idx = 0;
+    while instr_idx < instructions.len() {
+        let instruction = instructions[instr_idx];
+
+        if instruction & 0xFF00 == 0xFF00 {
+            // Literal
+            let literal = (instruction & 0x00FF) as u8;
+            safety_check!(output_stream.write(&[literal]));
+        } else {
+            // Match
+            let length = instruction as usize;
+            instr_idx += 1; // Move to the next instruction for offset
+            let offset = instructions[instr_idx] as usize;
+
+            safety_check!(output_stream.copy_forward(offset, length));
+        }
+
+        instr_idx += 1;
+    }
+
+    instructions.clear();
+    Ok(())
+}
+
+#[inline(always)]
+fn decode_block_instruction<I: DeflateInput, C>(
+    d: &mut LibdeflateDecompressor,
+    tmp_data: &mut DecompressTempData<I>,
+    context: &mut C,
+    literal_cb: fn(&mut C, u8) -> Result<(), LibdeflateError>,
+    backref_cb: fn(&mut C, u16, u16) -> Result<(), LibdeflateError>,
+) -> Result<bool, LibdeflateError> {
+    /* Decode a litlen symbol.  */
+    tmp_data
+        .input_bitstream
+        .ensure_bits(DEFLATE_MAX_LITLEN_CODEWORD_LEN);
+    let mut entry = d.litlen_decode_table[tmp_data.input_bitstream.bits(LITLEN_TABLEBITS) as usize];
+    if (entry & HUFFDEC_SUBTABLE_POINTER) != 0 {
+        /* Litlen subtable required (uncommon case)  */
+        tmp_data.input_bitstream.remove_bits(LITLEN_TABLEBITS);
+        entry = d.litlen_decode_table[(((entry >> HUFFDEC_RESULT_SHIFT) & 0xFFFF)
+            + tmp_data
+                .input_bitstream
+                .bits((entry & HUFFDEC_LENGTH_MASK) as usize))
+            as usize];
+    }
+    tmp_data
+        .input_bitstream
+        .remove_bits((entry & HUFFDEC_LENGTH_MASK) as usize);
+    if (entry & HUFFDEC_LITERAL) != 0 {
+        /* Literal  */
+        literal_cb(context, (entry >> HUFFDEC_RESULT_SHIFT) as u8)?;
+        return Ok(true);
+    }
+
+    /* Match or end-of-block  */
+
+    entry >>= HUFFDEC_RESULT_SHIFT;
+    tmp_data.input_bitstream.ensure_bits(MAX_ENSURE);
+
+    /* Pop the extra length bits and add them to the length base to
+     * produce the full length.  */
+    let length = (entry >> HUFFDEC_LENGTH_BASE_SHIFT)
+        + tmp_data
+            .input_bitstream
+            .pop_bits((entry & HUFFDEC_EXTRA_LENGTH_BITS_MASK) as usize);
+
+    /* The match destination must not end after the end of the
+     * output buffer.  For efficiency, combine this check with the
+     * end-of-block check.  We're using 0 for the special
+     * end-of-block length, so subtract 1 and it turn it into
+     * SIZE_MAX.  */
+    const_assert!(HUFFDEC_END_OF_BLOCK_LENGTH == 0);
+    if unlikely(length == HUFFDEC_END_OF_BLOCK_LENGTH) {
+        return Ok(false);
+    }
+
+    /* Decode the match offset.  */
+
+    entry = d.offset_decode_table[tmp_data.input_bitstream.bits(OFFSET_TABLEBITS) as usize];
+    if (entry & HUFFDEC_SUBTABLE_POINTER) != 0 {
+        /* Offset subtable required (uncommon case)  */
+        tmp_data.input_bitstream.remove_bits(OFFSET_TABLEBITS);
+        entry = d.offset_decode_table[(((entry >> HUFFDEC_RESULT_SHIFT) & 0xFFFF)
+            + tmp_data
+                .input_bitstream
+                .bits((entry & HUFFDEC_LENGTH_MASK) as usize))
+            as usize];
+    }
+    tmp_data
+        .input_bitstream
+        .remove_bits((entry & HUFFDEC_LENGTH_MASK) as usize);
+    entry >>= HUFFDEC_RESULT_SHIFT;
+
+    const_assert!(
+        can_ensure(DEFLATE_MAX_EXTRA_LENGTH_BITS + DEFLATE_MAX_OFFSET_CODEWORD_LEN)
+            && can_ensure(DEFLATE_MAX_EXTRA_OFFSET_BITS)
+    );
+    if !can_ensure(
+        DEFLATE_MAX_EXTRA_LENGTH_BITS
+            + DEFLATE_MAX_OFFSET_CODEWORD_LEN
+            + DEFLATE_MAX_EXTRA_OFFSET_BITS,
+    ) {
+        tmp_data
+            .input_bitstream
+            .ensure_bits(DEFLATE_MAX_EXTRA_OFFSET_BITS);
+    }
+
+    /* Pop the extra offset bits and add them to the offset base to
+     * produce the full offset.  */
+    let offset = (entry & HUFFDEC_OFFSET_BASE_MASK)
+        + tmp_data
+            .input_bitstream
+            .pop_bits((entry >> HUFFDEC_EXTRA_OFFSET_BITS_SHIFT) as usize);
+
+    /*
+     * Copy the match: 'length' bytes at 'out_next - offset' to
+     * 'out_next', possibly overlapping.  If the match doesn't end
+     * too close to the end of the buffer and offset >= WORDBYTES ||
+     * offset == 1, take a fast path which copies a word at a time
+     * -- potentially more than the length of the match, but that's
+     * fine as long as we check for enough extra space.
+     *
+     * The remaining cases are not performance-critical so are
+     * handled by a simple byte-by-byte copy.
+     */
+
+    backref_cb(context, length as u16, offset as u16)?;
+    Ok(true)
+}
+
+#[inline(never)]
+pub fn decompress_with_instr<I: DeflateInput, O: DeflateOutput>(
     d: &mut LibdeflateDecompressor,
     in_stream: &mut I,
     out_stream: &mut O,
 ) -> Result<(), LibdeflateError> {
+    const INSTRUCTIONS_BUFFER_SIZE: usize = 8192;
+    let mut instructions = Vec::with_capacity(INSTRUCTIONS_BUFFER_SIZE);
+
+    deflate_decompress_template(
+        d,
+        in_stream,
+        &mut instructions,
+        #[inline(always)]
+        |instructions, input, len| Ok(()),
+        #[inline(always)]
+        |instructions, literal| unsafe {
+            let len = instructions.len();
+            *instructions.get_unchecked_mut(len) = (255 << 8) | (literal as u16);
+            instructions.set_len(len + 1);
+
+            Ok(())
+        },
+        #[inline(always)]
+        |instructions, length, offset| {
+            unsafe {
+                let len = instructions.len();
+                *instructions.get_unchecked_mut(len) = length;
+                *instructions.get_unchecked_mut(len + 1) = offset;
+                instructions.set_len(len + 2);
+            }
+            Ok(())
+        },
+        |instructions| instructions.len() >= (INSTRUCTIONS_BUFFER_SIZE - 2),
+        |instructions| process_instructions(instructions, out_stream),
+    )
+}
+
+#[inline(never)]
+pub fn decompress_direct<I: DeflateInput, O: DeflateOutput>(
+    d: &mut LibdeflateDecompressor,
+    in_stream: &mut I,
+    out_stream: &mut O,
+) -> Result<(), LibdeflateError> {
+    deflate_decompress_template(
+        d,
+        in_stream,
+        out_stream,
+        |out_stream, input, len| {
+            safety_check!(input.read_exact_into(out_stream, len as usize));
+            Ok(())
+        },
+        #[inline(always)]
+        |out_stream, literal| {
+            if !out_stream.write(&[literal]) {
+                return Err(LibdeflateError::InsufficientSpace);
+            }
+            Ok(())
+        },
+        #[inline(always)]
+        |out_stream, length, offset| {
+            safety_check!(out_stream.copy_forward(offset as usize, length as usize));
+            Ok(())
+        },
+        #[inline(always)]
+        |_| true,
+        #[inline(always)]
+        |_| Ok(()),
+    )?;
+
+    Ok(())
+}
+
+#[inline(always)]
+pub(crate) fn deflate_decompress_template<I: DeflateInput, C>(
+    d: &mut LibdeflateDecompressor,
+    in_stream: &mut I,
+    context: &mut C,
+    uncompressed_cb: fn(&mut C, &mut BitStream<I>, usize) -> Result<(), LibdeflateError>,
+    literal_cb: fn(&mut C, u8) -> Result<(), LibdeflateError>,
+    backref_cb: fn(&mut C, u16, u16) -> Result<(), LibdeflateError>,
+    call_flush: fn(&C) -> bool,
+    mut flush_cb: impl FnMut(&mut C) -> Result<(), LibdeflateError>,
+) -> Result<(), LibdeflateError> {
     let mut tmp_data = DecompressTempData {
-        bitbuf: 0,
-        bitsleft: 0,
-        overrun_count: 0,
         is_final_block: false,
         block_type: 0,
         num_litlen_syms: 0,
         num_offset_syms: 0,
-        input_stream: in_stream,
-        output_stream: out_stream,
+        input_bitstream: BitStream::new(in_stream),
     };
+
+    let start = std::time::Instant::now();
+
+    let mut decode_time = Duration::ZERO;
+    let mut loop_time = Duration::ZERO;
 
     'block_done: loop {
         if tmp_data.is_final_block {
             break;
         }
 
+        let decode_time_start = start.elapsed();
+
         /* Starting to read the next block.  */
-
-        const_assert!(can_ensure(1 + 2 + 5 + 5 + 4));
-        ensure_bits(&mut tmp_data, 1 + 2 + 5 + 5 + 4);
-
-        /* BFINAL: 1 bit  */
-        tmp_data.is_final_block = pop_bits(&mut tmp_data, 1) != 0;
-
-        /* BTYPE: 2 bits  */
-        tmp_data.block_type = pop_bits(&mut tmp_data, 2);
-
-        let skip_decode_tables;
+        decode_huffman_header(&mut tmp_data);
 
         if tmp_data.block_type == DEFLATE_BLOCKTYPE_DYNAMIC_HUFFMAN {
             /* Dynamic Huffman block.  */
-
-            /* The order in which precode lengths are stored.  */
-            const DEFLATE_PRECODE_LENS_PERMUTATION: [u8; DEFLATE_NUM_PRECODE_SYMS] = [
-                16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
-            ];
-
-            /* Read the codeword length counts.  */
-
-            const_assert!(DEFLATE_NUM_LITLEN_SYMS == ((1 << 5) - 1) + 257);
-            tmp_data.num_litlen_syms = (pop_bits(&mut tmp_data, 5) + 257) as usize;
-
-            const_assert!(DEFLATE_NUM_OFFSET_SYMS == ((1 << 5) - 1) + 1);
-            tmp_data.num_offset_syms = (pop_bits(&mut tmp_data, 5) + 1) as usize;
-
-            const_assert!(DEFLATE_NUM_PRECODE_SYMS == ((1 << 4) - 1) + 4);
-            let num_explicit_precode_lens = (pop_bits(&mut tmp_data, 4) + 4) as usize;
-
             d.static_codes_loaded = false;
-
-            /* Read the precode codeword lengths.  */
-            const_assert!(DEFLATE_MAX_PRE_CODEWORD_LEN == (1 << 3) - 1);
-            for i in 0..num_explicit_precode_lens {
-                ensure_bits(&mut tmp_data, 3);
-                d.precode_lens[DEFLATE_PRECODE_LENS_PERMUTATION[i] as usize] =
-                    pop_bits(&mut tmp_data, 3) as u8;
-            }
-
-            for i in num_explicit_precode_lens..DEFLATE_NUM_PRECODE_SYMS {
-                d.precode_lens[DEFLATE_PRECODE_LENS_PERMUTATION[i] as usize] = 0;
-            }
-
-            /* Build the decode table for the precode.  */
-            safety_check!(build_precode_decode_table(d));
-
-            /* Expand the literal/length and offset codeword lengths.  */
-            let mut i = 0;
-            while i < tmp_data.num_litlen_syms + tmp_data.num_offset_syms {
-                ensure_bits(&mut tmp_data, DEFLATE_MAX_PRE_CODEWORD_LEN + 7);
-
-                /* (The code below assumes that the precode decode table
-                 * does not have any subtables.)  */
-                const_assert!(PRECODE_TABLEBITS == DEFLATE_MAX_PRE_CODEWORD_LEN);
-
-                /* Read the next precode symbol.  */
-                let entry = d.l.precode_decode_table
-                    [bits(&mut tmp_data, DEFLATE_MAX_PRE_CODEWORD_LEN) as usize];
-                remove_bits(&mut tmp_data, (entry & HUFFDEC_LENGTH_MASK) as usize);
-                let presym = entry >> HUFFDEC_RESULT_SHIFT;
-
-                if presym < 16 {
-                    /* Explicit codeword length  */
-                    d.l.lens[i] = presym as LenType;
-                    i += 1;
-                    continue;
-                }
-
-                /* Run-length encoded codeword lengths  */
-
-                /* Note: we don't need verify that the repeat count
-                 * doesn't overflow the number of elements, since we
-                 * have enough extra spaces to allow for the worst-case
-                 * overflow (138 zeroes when only 1 length was
-                 * remaining).
-                 *
-                 * In the case of the small repeat counts (presyms 16
-                 * and 17), it is fastest to always write the maximum
-                 * number of entries.  That gets rid of branches that
-                 * would otherwise be required.
-                 *
-                 * It is not just because of the numerical order that
-                 * our checks go in the order 'presym < 16', 'presym ==
-                 * 16', and 'presym == 17'.  For typical data this is
-                 * ordered from most frequent to least frequent case.
-                 */
-                const_assert!(DEFLATE_MAX_LENS_OVERRUN == 138 - 1);
-
-                if presym == 16 {
-                    /* Repeat the previous length 3 - 6 times  */
-                    safety_check!(i != 0);
-                    let rep_val = d.l.lens[i - 1];
-                    const_assert!(3 + ((1 << 2) - 1) == 6);
-                    let rep_count = (3 + pop_bits(&mut tmp_data, 2)) as usize;
-                    d.l.lens[i + 0] = rep_val;
-                    d.l.lens[i + 1] = rep_val;
-                    d.l.lens[i + 2] = rep_val;
-                    d.l.lens[i + 3] = rep_val;
-                    d.l.lens[i + 4] = rep_val;
-                    d.l.lens[i + 5] = rep_val;
-                    i += rep_count;
-                } else if presym == 17 {
-                    /* Repeat zero 3 - 10 times  */
-                    const_assert!(3 + ((1 << 3) - 1) == 10);
-                    let rep_count = (3 + pop_bits(&mut tmp_data, 3)) as usize;
-                    d.l.lens[i + 0] = 0;
-                    d.l.lens[i + 1] = 0;
-                    d.l.lens[i + 2] = 0;
-                    d.l.lens[i + 3] = 0;
-                    d.l.lens[i + 4] = 0;
-                    d.l.lens[i + 5] = 0;
-                    d.l.lens[i + 6] = 0;
-                    d.l.lens[i + 7] = 0;
-                    d.l.lens[i + 8] = 0;
-                    d.l.lens[i + 9] = 0;
-                    i += rep_count;
-                } else {
-                    /* Repeat zero 11 - 138 times  */
-                    const_assert!(11 + ((1 << 7) - 1) == 138);
-                    let rep_count = (11 + pop_bits(&mut tmp_data, 7)) as usize;
-                    d.l.lens[i..(i + rep_count)].fill(0);
-                    i += rep_count;
-                }
-            }
-            skip_decode_tables = false;
+            decode_dynamic_huffman_block(d, &mut tmp_data)?;
         } else if tmp_data.block_type == DEFLATE_BLOCKTYPE_UNCOMPRESSED {
             /* Uncompressed block: copy 'len' bytes literally from the input
              * buffer to the output buffer.  */
-
-            align_input(&mut tmp_data)?;
-
-            safety_check!(tmp_data.input_stream.ensure_length(4));
-
-            let len = unsafe { read_u16(&mut tmp_data) };
-            let nlen = unsafe { read_u16(&mut tmp_data) };
-
-            safety_check!(len == !nlen);
-
-            safety_check!(tmp_data
-                .input_stream
-                .read_exact_into(tmp_data.output_stream, len as usize));
-
+            decode_uncompressed_block(&mut tmp_data, context, uncompressed_cb)?;
             continue 'block_done;
         } else {
             safety_check!(tmp_data.block_type == DEFLATE_BLOCKTYPE_STATIC_HUFFMAN);
@@ -286,155 +382,38 @@ pub(crate) fn deflate_decompress_template<I: DeflateInput, O: DeflateOutput>(
              * dynamic Huffman block.
              */
 
-            skip_decode_tables = d.static_codes_loaded;
-
             if !d.static_codes_loaded {
                 d.static_codes_loaded = true;
-
-                const_assert!(DEFLATE_NUM_LITLEN_SYMS == 288);
-                const_assert!(DEFLATE_NUM_OFFSET_SYMS == 32);
-
-                for i in 0..144 {
-                    d.l.lens[i] = 8;
-                }
-                for i in 144..256 {
-                    d.l.lens[i] = 9;
-                }
-                for i in 256..280 {
-                    d.l.lens[i] = 7;
-                }
-                for i in 280..288 {
-                    d.l.lens[i] = 8;
-                }
-
-                for i in 288..(288 + 32) {
-                    d.l.lens[i] = 5;
-                }
-
-                tmp_data.num_litlen_syms = DEFLATE_NUM_LITLEN_SYMS;
-                tmp_data.num_offset_syms = DEFLATE_NUM_OFFSET_SYMS;
+                load_static_huffman_block(d, &mut tmp_data);
             }
         }
 
-        /* Decompressing a Huffman block (either dynamic or static)  */
-        if !skip_decode_tables {
-            safety_check!(build_offset_decode_table(
-                d,
-                tmp_data.num_litlen_syms,
-                tmp_data.num_offset_syms,
-            ));
-            safety_check!(build_litlen_decode_table(
-                d,
-                tmp_data.num_litlen_syms,
-                tmp_data.num_offset_syms,
-            ));
-        }
+        decode_time += start.elapsed() - decode_time_start;
+        let loop_time_start = start.elapsed();
 
         /* The main DEFLATE decode loop  */
-        while tmp_data.overrun_count < (size_of::<usize>() / 8) {
-            /* Decode a litlen symbol.  */
-            ensure_bits(&mut tmp_data, DEFLATE_MAX_LITLEN_CODEWORD_LEN);
-            let mut entry = d.litlen_decode_table[bits(&mut tmp_data, LITLEN_TABLEBITS) as usize];
-            if (entry & HUFFDEC_SUBTABLE_POINTER) != 0 {
-                /* Litlen subtable required (uncommon case)  */
-                remove_bits(&mut tmp_data, LITLEN_TABLEBITS);
-                entry = d.litlen_decode_table[(((entry >> HUFFDEC_RESULT_SHIFT) & 0xFFFF)
-                    + bits(&mut tmp_data, (entry & HUFFDEC_LENGTH_MASK) as usize))
-                    as usize];
-            }
-            remove_bits(&mut tmp_data, (entry & HUFFDEC_LENGTH_MASK) as usize);
-            if (entry & HUFFDEC_LITERAL) != 0 {
-                /* Literal  */
-                if !tmp_data
-                    .output_stream
-                    .write(&((entry >> HUFFDEC_RESULT_SHIFT) as u8).to_ne_bytes())
-                {
-                    return Err(LibdeflateError::InsufficientSpace);
+        'main_loop: loop {
+            loop {
+                if !decode_block_instruction(d, &mut tmp_data, context, literal_cb, backref_cb)? {
+                    break 'main_loop;
                 }
-                continue;
+                if call_flush(context) {
+                    break;
+                }
             }
-
-            /* Match or end-of-block  */
-
-            entry >>= HUFFDEC_RESULT_SHIFT;
-            ensure_bits(&mut tmp_data, MAX_ENSURE);
-
-            /* Pop the extra length bits and add them to the length base to
-             * produce the full length.  */
-            let length = (entry >> HUFFDEC_LENGTH_BASE_SHIFT)
-                + pop_bits(
-                    &mut tmp_data,
-                    (entry & HUFFDEC_EXTRA_LENGTH_BITS_MASK) as usize,
-                );
-
-            /* The match destination must not end after the end of the
-             * output buffer.  For efficiency, combine this check with the
-             * end-of-block check.  We're using 0 for the special
-             * end-of-block length, so subtract 1 and it turn it into
-             * SIZE_MAX.  */
-            const_assert!(HUFFDEC_END_OF_BLOCK_LENGTH == 0);
-            if unlikely(length == HUFFDEC_END_OF_BLOCK_LENGTH) {
-                continue 'block_done;
+            if tmp_data.input_bitstream.has_overrun() {
+                break;
             }
-
-            /* Decode the match offset.  */
-
-            entry = d.offset_decode_table[bits(&mut tmp_data, OFFSET_TABLEBITS) as usize];
-            if (entry & HUFFDEC_SUBTABLE_POINTER) != 0 {
-                /* Offset subtable required (uncommon case)  */
-                remove_bits(&mut tmp_data, OFFSET_TABLEBITS);
-                entry = d.offset_decode_table[(((entry >> HUFFDEC_RESULT_SHIFT) & 0xFFFF)
-                    + bits(&mut tmp_data, (entry & HUFFDEC_LENGTH_MASK) as usize))
-                    as usize];
-            }
-            remove_bits(&mut tmp_data, (entry & HUFFDEC_LENGTH_MASK) as usize);
-            entry >>= HUFFDEC_RESULT_SHIFT;
-
-            const_assert!(
-                can_ensure(DEFLATE_MAX_EXTRA_LENGTH_BITS + DEFLATE_MAX_OFFSET_CODEWORD_LEN)
-                    && can_ensure(DEFLATE_MAX_EXTRA_OFFSET_BITS)
-            );
-            if !can_ensure(
-                DEFLATE_MAX_EXTRA_LENGTH_BITS
-                    + DEFLATE_MAX_OFFSET_CODEWORD_LEN
-                    + DEFLATE_MAX_EXTRA_OFFSET_BITS,
-            ) {
-                ensure_bits(&mut tmp_data, DEFLATE_MAX_EXTRA_OFFSET_BITS);
-            }
-
-            /* Pop the extra offset bits and add them to the offset base to
-             * produce the full offset.  */
-            let offset = (entry & HUFFDEC_OFFSET_BASE_MASK)
-                + pop_bits(
-                    &mut tmp_data,
-                    (entry >> HUFFDEC_EXTRA_OFFSET_BITS_SHIFT) as usize,
-                );
-
-            /*
-             * Copy the match: 'length' bytes at 'out_next - offset' to
-             * 'out_next', possibly overlapping.  If the match doesn't end
-             * too close to the end of the buffer and offset >= WORDBYTES ||
-             * offset == 1, take a fast path which copies a word at a time
-             * -- potentially more than the length of the match, but that's
-             * fine as long as we check for enough extra space.
-             *
-             * The remaining cases are not performance-critical so are
-             * handled by a simple byte-by-byte copy.
-             */
-
-            /* The match source must not begin before the beginning of the
-             * output buffer.  */
-
-            safety_check!(tmp_data
-                .output_stream
-                .copy_forward(offset as usize, length as usize));
+            flush_cb(context)?;
         }
+        loop_time += start.elapsed() - loop_time_start;
     }
 
+    flush_cb(context)?;
     /* That was the last block.  */
 
     /* Discard any readahead bits and check for excessive overread */
-    align_input(&mut tmp_data)?;
+    tmp_data.input_bitstream.align_input(0)?;
 
     Ok(())
 }

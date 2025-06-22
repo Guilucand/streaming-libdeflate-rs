@@ -20,6 +20,7 @@
  * macros.
  */
 
+use crate::bitstream::BitStream;
 /*
  * The type for the bitbuffer variable ('bitbuf' described above).  For best
  * performance, this should have size equal to a machine word.
@@ -28,241 +29,20 @@
  * which they have to fill less often.
  */
 use crate::decompress_deflate::{
-    deflate_decompress_template, LenType, LITLEN_ENOUGH, LITLEN_TABLEBITS, OFFSET_ENOUGH,
-    OFFSET_TABLEBITS, PRECODE_ENOUGH, PRECODE_TABLEBITS,
+    decompress_direct, decompress_with_instr, deflate_decompress_template, LenType, LITLEN_ENOUGH,
+    LITLEN_TABLEBITS, OFFSET_ENOUGH, OFFSET_TABLEBITS, PRECODE_ENOUGH, PRECODE_TABLEBITS,
 };
 use crate::deflate_constants::*;
-use crate::{safety_check, DeflateInput, DeflateOutput, LibdeflateDecompressor, LibdeflateError};
-use nightly_quirks::branch_pred::{likely, unlikely};
+use crate::unchecked::{UncheckedArray, UncheckedSlice};
+use crate::{DeflateInput, DeflateOutput, LibdeflateDecompressor, LibdeflateError};
+use nightly_quirks::branch_pred::unlikely;
 
-type BitBufType = usize;
-
-pub struct DecompressTempData<'a, I: DeflateInput, O: DeflateOutput> {
-    pub bitbuf: BitBufType,
-    pub bitsleft: usize,
-    pub overrun_count: usize,
-    pub is_final_block: bool,
-    pub block_type: u32,
-    // len: u16,
-    // nlen: u16,
+pub struct DecompressTempData<'a, I: DeflateInput> {
+    pub input_bitstream: BitStream<'a, I>,
     pub num_litlen_syms: usize,
     pub num_offset_syms: usize,
-    // u16 tmp16;
-    // u32 tmp32;
-    pub input_stream: &'a mut I,
-    pub output_stream: &'a mut O,
-}
-
-/*
- * Number of bits the bitbuffer variable can hold.
- *
- * This is one less than the obvious value because of the optimized arithmetic
- * in FILL_BITS_WORDWISE() that leaves 'bitsleft' in the range
- * [WORDBITS - 8, WORDBITS - 1] rather than [WORDBITS - 7, WORDBITS].
- */
-const BITBUF_NBITS: usize = 8 * std::mem::size_of::<BitBufType>() - 1;
-
-/*
- * The maximum number of bits that can be ensured in the bitbuffer variable,
- * i.e. the maximum value of 'n' that can be passed ENSURE_BITS(n).  The decoder
- * only reads whole bytes from memory, so this is the lowest value of 'bitsleft'
- * at which another byte cannot be read without first consuming some bits.
- */
-pub const MAX_ENSURE: usize = BITBUF_NBITS - 7;
-
-/*
- * Evaluates to true if 'n' is a valid argument to ENSURE_BITS(n), or false if
- * 'n' is too large to be passed to ENSURE_BITS(n).  Note: if 'n' is a compile
- * time constant, then this expression will be a compile-type constant.
- * Therefore, CAN_ENSURE() can be used choose between alternative
- * implementations at compile time.
- */
-#[inline(always)]
-pub const fn can_ensure(n: usize) -> bool {
-    n <= MAX_ENSURE
-}
-
-/*
- * Fill the bitbuffer variable, reading one byte at a time.
- *
- * If we would overread the input buffer, we just don't read anything, leaving
- * the bits zeroed but marking them filled.  This simplifies the decompressor
- * because it removes the need to distinguish between real overreads and
- * overreads that occur only because of the decompressor's own lookahead.
- *
- * The disadvantage is that real overreads are not detected immediately.
- * However, this is safe because the decompressor is still guaranteed to make
- * forward progress when presented never-ending 0 bits.  In an existing block
- * output will be getting generated, whereas new blocks can only be uncompressed
- * (since the type code for uncompressed blocks is 0), for which we check for
- * previous overread.  But even if we didn't check, uncompressed blocks would
- * fail to validate because LEN would not equal ~NLEN.  So the decompressor will
- * eventually either detect that the output buffer is full, or detect invalid
- * input, or finish the final block.
- */
-#[inline(always)]
-pub fn fill_bits_bytewise<I: DeflateInput, O: DeflateOutput>(data: &mut DecompressTempData<I, O>) {
-    loop {
-        if likely(data.input_stream.ensure_length(1)) {
-            let mut byte = [0];
-            unsafe {
-                data.input_stream.read_unchecked(&mut byte);
-            }
-            data.bitbuf |= (byte[0] as BitBufType) << data.bitsleft;
-        } else {
-            data.overrun_count += 1;
-        }
-        data.bitsleft += 8;
-        if data.bitsleft > BITBUF_NBITS - 8 {
-            break;
-        }
-    }
-}
-
-/*
- * Fill the bitbuffer variable by reading the next word from the input buffer
- * and branchlessly updating 'in_next' and 'bitsleft' based on how many bits
- * were filled.  This can be significantly faster than FILL_BITS_BYTEWISE().
- * However, for this to work correctly, the word must be interpreted in
- * little-endian format.  In addition, the memory access may be unaligned.
- * Therefore, this method is most efficient on little-endian architectures that
- * support fast unaligned access, such as x86 and x86_64.
- *
- * For faster updating of 'bitsleft', we consider the bitbuffer size in bits to
- * be 1 less than the word size and therefore be all 1 bits.  Then the number of
- * bits filled is the value of the 0 bits in position >= 3 when changed to 1.
- * E.g. if words are 64 bits and bitsleft = 16 = b010000 then we refill b101000
- * = 40 bits = 5 bytes.  This uses only 4 operations to update 'in_next' and
- * 'bitsleft': one each of +, ^, >>, and |.  (Not counting operations the
- * compiler optimizes out.)  In contrast, the alternative of:
- *
- *	in_next += (BITBUF_NBITS - bitsleft) >> 3;
- *	bitsleft += (BITBUF_NBITS - bitsleft) & ~7;
- *
- * (where BITBUF_NBITS would be WORDBITS rather than WORDBITS - 1) would on
- * average refill an extra bit, but uses 5 operations: two +, and one each of
- * -, >>, and &.  Also the - and & must be completed before 'bitsleft' can be
- * updated, while the current solution updates 'bitsleft' with no dependencies.
- */
-#[inline(always)]
-pub unsafe fn fill_bits_wordwise<I: DeflateInput, O: DeflateOutput>(
-    data: &mut DecompressTempData<I, O>,
-) {
-    /* BITBUF_NBITS must be all 1's in binary, see above */
-    // const_assert!((BITBUF_NBITS & (BITBUF_NBITS + 1)) == 0);
-
-    data.bitbuf |= data.input_stream.get_le_word_no_advance() << data.bitsleft;
-    data.input_stream
-        .move_stream_pos(((data.bitsleft ^ BITBUF_NBITS) >> 3) as isize);
-    data.bitsleft |= BITBUF_NBITS & !7;
-}
-
-/*
- * Does the bitbuffer variable currently contain at least 'n' bits?
- */
-#[inline(always)]
-pub fn have_bits<I: DeflateInput, O: DeflateOutput>(
-    data: &mut DecompressTempData<I, O>,
-    n: usize,
-) -> bool {
-    data.bitsleft >= n
-}
-
-/*
- * Load more bits from the input buffer until the specified number of bits is
- * present in the bitbuffer variable.  'n' cannot be too large; see MAX_ENSURE
- * and CAN_ENSURE().
- */
-#[inline(always)]
-pub fn ensure_bits<I: DeflateInput, O: DeflateOutput>(
-    data: &mut DecompressTempData<I, O>,
-    n: usize,
-) {
-    if !have_bits(data, n) {
-        if cfg!(target_endian = "little")
-            && likely(
-                data.input_stream
-                    .ensure_length(std::mem::size_of::<BitBufType>()),
-            )
-        {
-            unsafe {
-                fill_bits_wordwise(data);
-            }
-        } else {
-            fill_bits_bytewise(data);
-        }
-    }
-}
-
-/*
- * Return the next 'n' bits from the bitbuffer variable without removing them.
- */
-#[inline(always)]
-pub fn bits<I: DeflateInput, O: DeflateOutput>(
-    data: &mut DecompressTempData<I, O>,
-    n: usize,
-) -> u32 {
-    (data.bitbuf as u32) & ((1u32 << (n)) - 1)
-}
-
-/*
- * Remove the next 'n' bits from the bitbuffer variable.
- */
-#[inline(always)]
-pub fn remove_bits<I: DeflateInput, O: DeflateOutput>(
-    data: &mut DecompressTempData<I, O>,
-    n: usize,
-) {
-    data.bitbuf >>= n;
-    data.bitsleft -= n
-}
-
-/*
- * Remove and return the next 'n' bits from the bitbuffer variable.
- */
-#[inline(always)]
-pub fn pop_bits<I: DeflateInput, O: DeflateOutput>(
-    data: &mut DecompressTempData<I, O>,
-    n: usize,
-) -> u32 {
-    let tmp = bits(data, n);
-    remove_bits(data, n);
-    tmp
-}
-
-/*
- * Verify that the input buffer hasn't been overread, then align the input to
- * the next byte boundary, discarding any remaining bits in the current byte.
- *
- * Note that if the bitbuffer variable currently contains more than 7 bits, then
- * we must rewind 'in_next', effectively putting those bits back.  Only the bits
- * in what would be the "current" byte if we were reading one byte at a time can
- * be actually discarded.
- */
-#[inline(always)]
-pub fn align_input<I: DeflateInput, O: DeflateOutput>(
-    data: &mut DecompressTempData<I, O>,
-) -> Result<(), LibdeflateError> {
-    safety_check!(data.overrun_count <= (data.bitsleft >> 3));
-    data.input_stream
-        .move_stream_pos(-(((data.bitsleft >> 3) - data.overrun_count) as isize));
-    data.overrun_count = 0;
-    data.bitbuf = 0;
-    data.bitsleft = 0;
-    Ok(())
-}
-
-/*
- * Read a 16-bit value from the input.  This must have been preceded by a call
- * to ALIGN_INPUT(), and the caller must have already checked for overrun.
- */
-#[inline(always)]
-pub unsafe fn read_u16<I: DeflateInput, O: DeflateOutput>(
-    data: &mut DecompressTempData<I, O>,
-) -> u16 {
-    let mut bytes = [0, 0];
-    data.input_stream.read_unchecked(&mut bytes);
-    u16::from_le_bytes(bytes)
+    pub block_type: u32,
+    pub is_final_block: bool,
 }
 
 /*****************************************************************************
@@ -341,7 +121,7 @@ const fn hr_entry(presym: u32) -> u32 {
     huffdec_result_entry(presym)
 }
 
-const PRECODE_DECODE_RESULTS: [u32; DEFLATE_NUM_PRECODE_SYMS] = [
+const PRECODE_DECODE_RESULTS: UncheckedArray<u32, DEFLATE_NUM_PRECODE_SYMS> = UncheckedArray([
     hr_entry(0),
     hr_entry(1),
     hr_entry(2),
@@ -361,7 +141,7 @@ const PRECODE_DECODE_RESULTS: [u32; DEFLATE_NUM_PRECODE_SYMS] = [
     hr_entry(16),
     hr_entry(17),
     hr_entry(18),
-];
+]);
 
 /* The decode result for each litlen symbol.  For literals, this is the literal
  * value itself and the HUFFDEC_LITERAL flag.  For lengths, this is the length
@@ -382,7 +162,7 @@ const fn ld2_entry(length_base: u32, num_extra_bits: u32) -> u32 {
     huffdec_result_entry((length_base << HUFFDEC_LENGTH_BASE_SHIFT) | num_extra_bits)
 }
 
-const LITLEN_DECODE_RESULTS: [u32; DEFLATE_NUM_LITLEN_SYMS] = [
+const LITLEN_DECODE_RESULTS: UncheckedArray<u32, DEFLATE_NUM_LITLEN_SYMS> = UncheckedArray([
     /* Literals  */
     ld1_entry(0),
     ld1_entry(1),
@@ -674,7 +454,7 @@ const LITLEN_DECODE_RESULTS: [u32; DEFLATE_NUM_LITLEN_SYMS] = [
     ld2_entry(258, 0),
     ld2_entry(258, 0),
     ld2_entry(258, 0),
-];
+]);
 
 /* The decode result for each offset symbol.  This is the offset base and the
  * number of extra offset bits.  */
@@ -687,7 +467,7 @@ const fn odr_entry(offset_base: u32, num_extra_bits: u32) -> u32 {
     huffdec_result_entry((num_extra_bits << HUFFDEC_EXTRA_OFFSET_BITS_SHIFT) | offset_base)
 }
 
-const OFFSET_DECODE_RESULTS: [u32; DEFLATE_NUM_OFFSET_SYMS] = [
+const OFFSET_DECODE_RESULTS: UncheckedArray<u32, DEFLATE_NUM_OFFSET_SYMS> = UncheckedArray([
     odr_entry(1, 0),
     odr_entry(2, 0),
     odr_entry(3, 0),
@@ -720,7 +500,7 @@ const OFFSET_DECODE_RESULTS: [u32; DEFLATE_NUM_OFFSET_SYMS] = [
     odr_entry(24577, 13),
     odr_entry(32769, 14),
     odr_entry(49153, 14),
-];
+]);
 
 #[inline(always)]
 const fn bsr32(val: u32) -> u32 {
@@ -765,18 +545,20 @@ const fn bsr32(val: u32) -> u32 {
  * Returns %true if successful; %false if the codeword lengths do not form a
  * valid Huffman code.
  */
-pub fn build_decode_table(
-    decode_table: &mut [u32],
-    lens: &[LenType],
+pub fn build_decode_table<const DECODE_TABLE_SIZE: usize, const DECODE_RESULTS_SIZE: usize>(
+    decode_table: &mut UncheckedArray<u32, DECODE_TABLE_SIZE>,
+    lens: &UncheckedSlice<LenType>,
     num_syms: usize,
-    decode_results: &[u32],
+    decode_results: &UncheckedArray<u32, DECODE_RESULTS_SIZE>,
     table_bits: usize,
     max_codeword_len: usize,
     mut sorted_syms: *mut u16,
 ) -> bool {
-    let mut len_counts: [u32; DEFLATE_MAX_CODEWORD_LEN + 1] = [0; DEFLATE_MAX_CODEWORD_LEN + 1];
-    let mut offsets: [u32; DEFLATE_MAX_CODEWORD_LEN + 1] = [0; DEFLATE_MAX_CODEWORD_LEN + 1];
-    let mut count: u32; /* num codewords remaining with this length */
+    let mut len_counts: UncheckedArray<u8, { DEFLATE_MAX_CODEWORD_LEN + 1 }> =
+        UncheckedArray([0; DEFLATE_MAX_CODEWORD_LEN + 1]);
+    let mut offsets: UncheckedArray<u16, { DEFLATE_MAX_CODEWORD_LEN + 1 }> =
+        UncheckedArray([0; DEFLATE_MAX_CODEWORD_LEN + 1]);
+    let mut count: u8; /* num codewords remaining with this length */
     let mut codespace_used: u32; /* codespace used out of '2^max_codeword_len' */
     let mut cur_table_end: usize; /* end index of current table */
     let mut subtable_prefix: usize; /* codeword prefix of current subtable */
@@ -784,9 +566,6 @@ pub fn build_decode_table(
     let mut subtable_bits: usize; /* log2 of current subtable length */
 
     /* Count how many codewords have each length, including 0. */
-    for len in 0..=max_codeword_len {
-        len_counts[len] = 0;
-    }
     for sym in 0..num_syms {
         len_counts[lens[sym] as usize] += 1;
     }
@@ -806,14 +585,14 @@ pub fn build_decode_table(
         u32::MAX / (1u32 << (DEFLATE_MAX_CODEWORD_LEN - 1)) >= DEFLATE_MAX_NUM_SYMS as u32
     );
 
-    offsets[0] = 0;
-    offsets[1] = len_counts[0];
+    // offsets[0] = 0;
+    offsets[1] = len_counts[0] as u16;
     codespace_used = 0;
     for len in 1..max_codeword_len {
-        offsets[len + 1] = offsets[len] + len_counts[len];
-        codespace_used = (codespace_used << 1) + len_counts[len];
+        offsets[len + 1] = offsets[len] + len_counts[len] as u16;
+        codespace_used = (codespace_used << 1) + len_counts[len] as u32;
     }
-    codespace_used = (codespace_used << 1) + len_counts[max_codeword_len];
+    codespace_used = (codespace_used << 1) + len_counts[max_codeword_len] as u32;
 
     for sym in 0..num_syms {
         unsafe {
@@ -1004,10 +783,11 @@ pub fn build_decode_table(
              * the subtable eventually.
              */
             subtable_bits = len - table_bits;
-            codespace_used = count;
+            codespace_used = count as u32;
             while codespace_used < (1u32 << subtable_bits) {
                 subtable_bits += 1;
-                codespace_used = (codespace_used << 1) + len_counts[table_bits + subtable_bits];
+                codespace_used =
+                    (codespace_used << 1) + len_counts[table_bits + subtable_bits] as u32;
             }
             cur_table_end = subtable_start + (1 << subtable_bits);
 
@@ -1063,7 +843,7 @@ pub fn build_precode_decode_table(d: &mut LibdeflateDecompressor) -> bool {
 
     return build_decode_table(
         &mut d.l.precode_decode_table,
-        &mut d.precode_lens,
+        d.precode_lens.as_ref(),
         DEFLATE_NUM_PRECODE_SYMS,
         &PRECODE_DECODE_RESULTS,
         PRECODE_TABLEBITS,
@@ -1083,7 +863,7 @@ pub fn build_litlen_decode_table(
 
     return build_decode_table(
         &mut d.litlen_decode_table,
-        &mut d.l.lens[..],
+        d.l.lens.as_ref(),
         num_litlen_syms,
         &LITLEN_DECODE_RESULTS,
         LITLEN_TABLEBITS,
@@ -1103,7 +883,7 @@ pub fn build_offset_decode_table(
 
     return build_decode_table(
         &mut d.offset_decode_table,
-        &d.l.lens[num_litlen_syms..],
+        &d.l.lens[num_litlen_syms..d.l.lens.len()],
         num_offset_syms,
         &OFFSET_DECODE_RESULTS,
         OFFSET_TABLEBITS,
@@ -1170,5 +950,47 @@ pub fn libdeflate_deflate_decompress<I: DeflateInput, O: DeflateOutput>(
     in_stream: &mut I,
     out_stream: &mut O,
 ) -> Result<(), LibdeflateError> {
-    deflate_decompress_template(d, in_stream, out_stream)
+    decompress_direct(d, in_stream, out_stream)
+    // decompress_with_instr(d, in_stream, out_stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::block_finder::CodepointChecker;
+
+    type LenType = u8;
+    const DEFLATE_NUM_PRECODE_SYMS: usize = 19;
+
+    #[test]
+    fn test_decode_validity_fast() {
+        // let start = std::time::Instant::now();
+        // let mut value = start.elapsed().as_nanos() as u64;
+
+        // const COUNT: usize = 1000000000;
+
+        // let mut checker1 =
+        //     CodepointChecker::new([1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 6, 5, 4, 3, 2, 1, 2, 3, 4]);
+
+        // CodepointChecker::debug_values("se0", checker1.exp_lens[0], 10);
+        // CodepointChecker::debug_values("se1", checker1.exp_lens[1], 9);
+
+        // let mut checker2 = checker1.clone();
+        // let mut checker3 = checker1.clone();
+
+        // let mut results = 0;
+        // for i in 0..COUNT {
+        //     results += checker1.roll_lens(((i as u8) + 7) % 8, i as u8 % 16 + 1); // ((i as u8) + 0) % 16);
+        //     results += checker2.roll_lens(((i as u8) + 1) % 8, ((i as u8) + 1) % 16);
+        //     results += checker3.roll_lens(((i as u8) + 2) % 8, ((i as u8) + 2) % 16);
+        // }
+
+        // let elapsed = start.elapsed().as_nanos();
+        // let elapsed_per_byte = elapsed as f64 / COUNT as f64 / 3.0 * 8.0;
+        // println!(
+        //     "Elapsed time: {:.4} nanoseconds per byte: SPEED: {:.2} MB/s value: {}",
+        //     elapsed_per_byte,
+        //     1_000_000_000.0 / elapsed_per_byte / 1024.0 / 1024.0,
+        //     results
+        // );
+    }
 }

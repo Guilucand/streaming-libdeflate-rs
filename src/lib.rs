@@ -1,10 +1,14 @@
-#![cfg_attr(debug_assertions, deny(warnings))]
+// #![cfg_attr(debug_assertions, deny(warnings))]
+pub mod bitstream;
+pub(crate) mod block_finder;
+pub mod decode_blocks;
 pub mod decompress_deflate;
 pub mod decompress_gzip;
 mod decompress_utils;
 mod deflate_constants;
 mod gzip_constants;
 pub mod streams;
+pub mod unchecked;
 mod utils;
 
 #[macro_use]
@@ -18,10 +22,9 @@ use crate::decompress_deflate::{
 };
 use crate::decompress_gzip::libdeflate_gzip_decompress;
 use crate::deflate_constants::{DEFLATE_MAX_NUM_SYMS, DEFLATE_NUM_PRECODE_SYMS};
-use crate::streams::deflate_chunked_buffer_input::DeflateChunkedBufferInput;
 use crate::streams::deflate_chunked_buffer_output::DeflateChunkedBufferOutput;
-use std::fs::File;
-use std::io::Read;
+use crate::streams::deflate_filebuffer_input::DeflateFileBufferInput;
+use crate::unchecked::UncheckedArray;
 use std::mem::{size_of, MaybeUninit};
 use std::path::Path;
 
@@ -32,14 +35,14 @@ use std::path::Path;
  * comfortably allocate on the stack.
  */
 pub struct LibdeflateDecompressor {
-    pub(crate) precode_lens: [LenType; DEFLATE_NUM_PRECODE_SYMS],
+    pub(crate) precode_lens: UncheckedArray<LenType, DEFLATE_NUM_PRECODE_SYMS>,
     pub(crate) l: _DecStruct,
-    pub(crate) litlen_decode_table: [u32; LITLEN_ENOUGH],
+    pub(crate) litlen_decode_table: UncheckedArray<u32, LITLEN_ENOUGH>,
 
-    pub(crate) offset_decode_table: [u32; OFFSET_ENOUGH],
+    pub(crate) offset_decode_table: UncheckedArray<u32, OFFSET_ENOUGH>,
 
     /* used only during build_decode_table() */
-    pub(crate) sorted_syms: [u16; DEFLATE_MAX_NUM_SYMS],
+    pub(crate) sorted_syms: UncheckedArray<u16, DEFLATE_MAX_NUM_SYMS>,
     pub(crate) static_codes_loaded: bool,
 }
 
@@ -67,6 +70,7 @@ pub trait DeflateInput {
 
     unsafe fn get_le_word_no_advance(&mut self) -> usize;
     fn move_stream_pos(&mut self, amount: isize) -> bool;
+    fn tell_stream_pos(&self) -> usize;
     fn read(&mut self, out_data: &mut [u8]) -> usize;
     fn ensure_length(&mut self, len: usize) -> bool;
     unsafe fn read_unchecked(&mut self, out_data: &mut [u8]);
@@ -128,17 +132,16 @@ pub fn decompress_file_buffered(
     func: impl FnMut(&[u8]) -> Result<(), ()>,
     buf_size: usize,
 ) -> Result<(), LibdeflateError> {
-    let mut read_file = File::open(file).unwrap();
+    // let mut read_file = File::open(file).unwrap();
 
-    let mut input_stream =
-        DeflateChunkedBufferInput::new(|buf| read_file.read(buf).unwrap_or(0), buf_size);
+    let mut input_stream = DeflateFileBufferInput::new(file.as_ref()); // |buf| read_file.read(buf).unwrap_or(0), buf_size);
 
     let mut output_stream = DeflateChunkedBufferOutput::new(func, buf_size);
 
     let mut decompressor = libdeflate_alloc_decompressor();
 
     while input_stream.ensure_length(1) {
-        libdeflate_gzip_decompress(&mut decompressor, &mut input_stream, &mut output_stream)?
+        libdeflate_gzip_decompress(&mut decompressor, &mut input_stream, &mut output_stream)?;
     }
     Ok(())
 }

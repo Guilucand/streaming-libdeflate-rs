@@ -4,6 +4,7 @@ use std::cmp::min;
 
 pub struct DeflateChunkedBufferInput<'a> {
     buffer: Box<[u8]>,
+    global_position_offset: usize,
     position: usize,
     last_position: usize,
     func: Box<dyn FnMut(&mut [u8]) -> usize + 'a>,
@@ -13,18 +14,21 @@ impl<'a> DeflateChunkedBufferInput<'a> {
     pub fn new<F: FnMut(&mut [u8]) -> usize + 'a>(read_func: F, buf_size: usize) -> Self {
         Self {
             buffer: unsafe { NightlyUtils::box_new_uninit_slice_assume_init(buf_size) },
+            global_position_offset: 0,
             position: 0,
             last_position: 0,
             func: Box::new(read_func),
         }
     }
 
+    #[cold]
     fn refill_buffer(&mut self, min_amount: usize) -> bool {
         let keep_buf_len = min(self.position, Self::MAX_LOOK_BACK);
 
         let move_offset = self.position - keep_buf_len;
         let move_amount = self.last_position - move_offset;
 
+        self.global_position_offset += move_offset;
         unsafe {
             std::ptr::copy(
                 self.buffer.as_ptr().add(move_offset),
@@ -59,11 +63,14 @@ impl<'a> DeflateInput for DeflateChunkedBufferInput<'a> {
                     return false;
                 }
             }
-            self.position += amount as usize
         } else {
-            self.position -= (-amount) as usize
         }
+        self.position = self.position.wrapping_add_signed(amount);
         self.position <= self.last_position
+    }
+
+    fn tell_stream_pos(&self) -> usize {
+        self.global_position_offset + self.position
     }
 
     #[inline(always)]

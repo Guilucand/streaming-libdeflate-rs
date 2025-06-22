@@ -35,6 +35,10 @@ impl DeflateInput for DeflateFileBufferInput {
         self.position < self.file.len()
     }
 
+    fn tell_stream_pos(&self) -> usize {
+        self.position
+    }
+
     #[inline(always)]
     fn read(&mut self, out_data: &mut [u8]) -> usize {
         let avail_bytes = min(out_data.len(), self.file.len() - self.position);
