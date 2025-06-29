@@ -3,13 +3,13 @@ use crate::{
     decompress_deflate::{LenType, PRECODE_TABLEBITS},
     decompress_utils::{
         build_litlen_decode_table, build_offset_decode_table, build_precode_decode_table,
-        DecompressTempData, HUFFDEC_LENGTH_MASK, HUFFDEC_RESULT_SHIFT,
+        DecompressTempData,
     },
     deflate_constants::{
         DEFLATE_MAX_LENS_OVERRUN, DEFLATE_MAX_PRE_CODEWORD_LEN, DEFLATE_NUM_LITLEN_SYMS,
         DEFLATE_NUM_OFFSET_SYMS, DEFLATE_NUM_PRECODE_SYMS,
     },
-    safety_check, DeflateInput, DeflateOutput, LibdeflateDecompressor, LibdeflateError,
+    safety_check, DeflateInput, LibdeflateDecompressor, LibdeflateError,
 };
 
 #[inline(always)]
@@ -89,8 +89,8 @@ pub fn decode_dynamic_huffman_block<I: DeflateInput>(
             [tmp_data.input_bitstream.bits(DEFLATE_MAX_PRE_CODEWORD_LEN) as usize];
         tmp_data
             .input_bitstream
-            .remove_bits((entry & HUFFDEC_LENGTH_MASK) as usize);
-        let presym = entry >> HUFFDEC_RESULT_SHIFT;
+            .remove_bits(entry.get_maintable_length() as usize);
+        let presym = entry.get_result();
 
         if presym < 16 {
             /* Explicit codeword length  */

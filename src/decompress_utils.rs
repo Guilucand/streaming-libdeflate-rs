@@ -42,6 +42,7 @@ pub struct DecompressTempData<'a, I: DeflateInput> {
     pub num_litlen_syms: usize,
     pub num_offset_syms: usize,
     pub block_type: u32,
+    pub entry: DecodeEntry,
     pub is_final_block: bool,
 }
 
@@ -50,457 +51,626 @@ pub struct DecompressTempData<'a, I: DeflateInput> {
  *****************************************************************************/
 
 /*
- * A decode table for order TABLEBITS consists of a main table of (1 <<
- * TABLEBITS) entries followed by a variable number of subtables.
+* A decode table for order TABLEBITS consists of a main table of (1 <<
+* TABLEBITS) entries followed by a variable number of subtables.
+*
+* The decoding algorithm takes the next TABLEBITS bits of compressed data and
+* uses them as an index into the decode table.  The resulting entry is either a
+* "direct entry", meaning that it contains the value desired, or a "subtable
+* pointer", meaning that the entry references a subtable that must be indexed
+* using more bits of the compressed data to decode the symbol.
+*
+* Each decode table (a main table along with its subtables, if any) is
+* associated with a Huffman code.  Logically, the result of a decode table
+* lookup is a symbol from the alphabet from which the corresponding Huffman
+* code was constructed.  A symbol with codeword length n <= TABLEBITS is
+* associated with 2**(TABLEBITS - n) direct entries in the table, whereas a
+* symbol with codeword length n > TABLEBITS is associated with one or more
+* subtable entries.
+*
+* On top of this basic design, we implement several optimizations:
+*
+* - We store the length of each codeword directly in each of its decode table
+*   entries.  This allows the codeword length to be produced without indexing
+*   an additional table.
+*
+* - When beneficial, we don't store the Huffman symbol itself, but instead data
+*   generated from it.  For example, when decoding an offset symbol in DEFLATE,
+*   it's more efficient if we can decode the offset base and number of extra
+*   offset bits directly rather than decoding the offset symbol and then
+*   looking up both of those values in an additional table or tables.
+*
+* The size of each decode table entry is 32 bits, which provides slightly
+* better performance than 16-bit entries on 32 and 64 bit processers, provided
+* that the table doesn't get so large that it takes up too much memory and
+* starts generating cache misses.  The bits of each decode table entry are
+* defined as follows:
+* LEGACY:
+* - Bits 30 -- 31: flags (see below)
+* - Bits 8 -- 29: decode result: a Huffman symbol or related data
+* - Bits 0 -- 7: codeword length
+* NEW:
+ * Here is the format of our litlen decode table entries.  Bits not explicitly
+ * described contain zeroes:
  *
- * The decoding algorithm takes the next TABLEBITS bits of compressed data and
- * uses them as an index into the decode table.  The resulting entry is either a
- * "direct entry", meaning that it contains the value desired, or a "subtable
- * pointer", meaning that the entry references a subtable that must be indexed
- * using more bits of the compressed data to decode the symbol.
+ *	Literals:
+ *		Bit 31:     1 (HUFFDEC_LITERAL)
+ *		Bit 23-16:  literal value
+ *		Bit 15:     0 (!HUFFDEC_EXCEPTIONAL)
+ *		Bit 14:     0 (!HUFFDEC_SUBTABLE_POINTER)
+ *		Bit 13:     0 (!HUFFDEC_END_OF_BLOCK)
+ *		Bit 11-8:   remaining codeword length [not used]
+ *		Bit 3-0:    remaining codeword length
+ *	Lengths:
+ *		Bit 31:     0 (!HUFFDEC_LITERAL)
+ *		Bit 24-16:  length base value
+ *		Bit 15:     0 (!HUFFDEC_EXCEPTIONAL)
+ *		Bit 14:     0 (!HUFFDEC_SUBTABLE_POINTER)
+ *		Bit 13:     0 (!HUFFDEC_END_OF_BLOCK)
+ *		Bit 11-8:   remaining codeword length
+ *		Bit 4-0:    remaining codeword length + number of extra bits
+ *	End of block:
+ *		Bit 31:     0 (!HUFFDEC_LITERAL)
+ *		Bit 15:     1 (HUFFDEC_EXCEPTIONAL)
+ *		Bit 14:     0 (!HUFFDEC_SUBTABLE_POINTER)
+ *		Bit 13:     1 (HUFFDEC_END_OF_BLOCK)
+ *		Bit 11-8:   remaining codeword length [not used]
+ *		Bit 3-0:    remaining codeword length
+ *	Subtable pointer:
+ *		Bit 31:     0 (!HUFFDEC_LITERAL)
+ *		Bit 30-16:  index of start of subtable
+ *		Bit 15:     1 (HUFFDEC_EXCEPTIONAL)
+ *		Bit 14:     1 (HUFFDEC_SUBTABLE_POINTER)
+ *		Bit 13:     0 (!HUFFDEC_END_OF_BLOCK)
+ *		Bit 11-8:   number of subtable bits
+ *		Bit 3-0:    number of main table bits
  *
- * Each decode table (a main table along with its subtables, if any) is
- * associated with a Huffman code.  Logically, the result of a decode table
- * lookup is a symbol from the alphabet from which the corresponding Huffman
- * code was constructed.  A symbol with codeword length n <= TABLEBITS is
- * associated with 2**(TABLEBITS - n) direct entries in the table, whereas a
- * symbol with codeword length n > TABLEBITS is associated with one or more
- * subtable entries.
+ * This format has several desirable properties:
  *
- * On top of this basic design, we implement several optimizations:
+ *	- The codeword length, length slot base, and number of extra length bits
+ *	  are all built in.  This eliminates the need to separately look up this
+ *	  information by indexing separate arrays by symbol or length slot.
  *
- * - We store the length of each codeword directly in each of its decode table
- *   entries.  This allows the codeword length to be produced without indexing
- *   an additional table.
+ *	- The HUFFDEC_* flags enable easily distinguishing between the different
+ *	  types of entries.  The HUFFDEC_LITERAL flag enables a fast path for
+ *	  literals; the high bit is used for this, as some CPUs can test the
+ *	  high bit more easily than other bits.  The HUFFDEC_EXCEPTIONAL flag
+ *	  makes it possible to detect the two unlikely cases (subtable pointer
+ *	  and end of block) in a single bit flag test.
  *
- * - When beneficial, we don't store the Huffman symbol itself, but instead data
- *   generated from it.  For example, when decoding an offset symbol in DEFLATE,
- *   it's more efficient if we can decode the offset base and number of extra
- *   offset bits directly rather than decoding the offset symbol and then
- *   looking up both of those values in an additional table or tables.
+ *	- The low byte is the number of bits that need to be removed from the
+ *	  bitstream; this makes this value easily accessible, and it enables the
+ *	  micro-optimization of doing 'bitsleft -= entry' instead of
+ *	  'bitsleft -= (u8)entry'.  It also includes the number of extra bits,
+ *	  so they don't need to be removed separately.
  *
- * The size of each decode table entry is 32 bits, which provides slightly
- * better performance than 16-bit entries on 32 and 64 bit processers, provided
- * that the table doesn't get so large that it takes up too much memory and
- * starts generating cache misses.  The bits of each decode table entry are
- * defined as follows:
+ *	- The flags in bits 15-13 are arranged to be 0 when the
+ *	  "remaining codeword length" in bits 11-8 is needed, making this value
+ *	  fairly easily accessible as well via a shift and downcast.
  *
- * - Bits 30 -- 31: flags (see below)
- * - Bits 8 -- 29: decode result: a Huffman symbol or related data
- * - Bits 0 -- 7: codeword length
- */
+ *	- Similarly, bits 13-12 are 0 when the "subtable bits" in bits 11-8 are
+ *	  needed, making it possible to extract this value with '& 0x3F' rather
+ *	  than '& 0xF'.  This value is only used as a shift amount, so this can
+ *	  save an 'and' instruction as the masking by 0x3F happens implicitly.
+ *
+ * litlen_decode_results[] contains the static part of the entry for each
+ * symbol.  make_decode_table_entry() produces the final entries.
+*/
 
-/*
- * This flag is set in all main decode table entries that represent subtable
- * pointers.
- */
-pub const HUFFDEC_SUBTABLE_POINTER: u32 = 0x80000000;
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct DecodeEntry(pub u32);
 
-/*
- * This flag is set in all entries in the litlen decode table that represent
- * literals.
- */
-pub const HUFFDEC_LITERAL: u32 = 0x40000000;
+impl DecodeEntry {
+    pub const DEFAULT: DecodeEntry = DecodeEntry(0);
 
-/* Mask for extracting the codeword length from a decode table entry.  */
-pub const HUFFDEC_LENGTH_MASK: u32 = 0xFF;
+    /* Indicates a literal entry in the litlen decode table */
+    const ENTRY_LITERAL: u32 = 0x80000000;
 
-/* Shift to extract the decode result from a decode table entry.  */
-pub const HUFFDEC_RESULT_SHIFT: usize = 8;
+    /* Indicates that HUFFDEC_SUBTABLE_POINTER or HUFFDEC_END_OF_BLOCK is set */
+    const ENTRY_EXCEPTIONAL: u32 = 0x00008000;
 
-/* Shift a decode result into its position in the decode table entry.  */
-#[inline(always)]
-const fn huffdec_result_entry(result: u32) -> u32 {
-    result << HUFFDEC_RESULT_SHIFT
+    /* Indicates a subtable pointer entry in the litlen or offset decode table */
+    const ENTRY_SUBTABLE_POINTER: u32 = 0x00004000;
+
+    /* Indicates an end-of-block entry in the litlen decode table */
+    const ENTRY_END_OF_BLOCK: u32 = 0x00002000;
+
+    /* Shift to extract the decode result from a decode table entry.  */
+    pub const ENTRY_RESULT_SHIFT: usize = 16;
+
+    pub const ENTRY_SUBTABLE_BITS_SHIFT: usize = 8;
+
+    /* Mask for extracting the codeword length from a decode table entry.  */
+    pub const ENTRY_LENGTH_MASK: u32 = 0x3F;
+
+    #[inline(always)]
+    const fn new_literal(literal: u8) -> Self {
+        DecodeEntry(Self::ENTRY_LITERAL | ((literal as u32) << Self::ENTRY_RESULT_SHIFT))
+    }
+
+    #[inline(always)]
+    const fn new_result(result: u32) -> Self {
+        DecodeEntry(result << Self::ENTRY_RESULT_SHIFT)
+    }
+
+    #[inline(always)]
+    const fn new_length(length: u32, num_extra_bits: u8) -> Self {
+        DecodeEntry(
+            (length << Self::ENTRY_RESULT_SHIFT)
+                | ((num_extra_bits as u32) << Self::ENTRY_SUBTABLE_BITS_SHIFT),
+        )
+    }
+
+    #[inline(always)]
+    const fn new_offset(offset_base: u32, num_extra_bits: u8) -> DecodeEntry {
+        DecodeEntry(
+            (offset_base << Self::ENTRY_RESULT_SHIFT)
+                | ((num_extra_bits as u32) << Self::ENTRY_SUBTABLE_BITS_SHIFT),
+        )
+    }
+
+    #[inline(always)]
+    const fn new_subtable_pointer(
+        subtable_index: u32,
+        subtable_bits: u8,
+        main_table_bits: u8,
+    ) -> Self {
+        DecodeEntry(
+            Self::ENTRY_SUBTABLE_POINTER
+                | Self::ENTRY_EXCEPTIONAL
+                | (subtable_index << Self::ENTRY_RESULT_SHIFT)
+                | (subtable_bits as u32) << Self::ENTRY_SUBTABLE_BITS_SHIFT
+                | (main_table_bits as u32),
+        )
+    }
+
+    pub const fn is_literal(self) -> bool {
+        (self.0 & Self::ENTRY_LITERAL) != 0
+    }
+
+    #[inline(always)]
+    pub const fn is_exceptional(self) -> bool {
+        (self.0 & Self::ENTRY_EXCEPTIONAL) != 0
+    }
+
+    #[inline(always)]
+    pub const fn is_subtable_pointer(self) -> bool {
+        (self.0 & Self::ENTRY_SUBTABLE_POINTER) != 0
+    }
+
+    #[inline(always)]
+    pub const fn is_end_of_block(self) -> bool {
+        (self.0 & Self::ENTRY_END_OF_BLOCK) != 0
+    }
+
+    #[inline(always)]
+    pub const fn get_result(self) -> u32 {
+        self.0 >> Self::ENTRY_RESULT_SHIFT
+    }
+
+    #[inline(always)]
+    pub const fn get_literal(self) -> u8 {
+        (self.0 >> Self::ENTRY_RESULT_SHIFT) as u8
+    }
+
+    #[inline(always)]
+    pub const fn get_subtable_length(self) -> u8 {
+        ((self.0 >> Self::ENTRY_SUBTABLE_BITS_SHIFT) & Self::ENTRY_LENGTH_MASK) as u8
+    }
+
+    #[inline(always)]
+    pub const fn get_maintable_length(self) -> u8 {
+        self.0 as u8
+    }
+
+    /*
+     * make_decode_table_entry() creates a decode table entry for the given symbol
+     * by combining the static part 'decode_results[sym]' with the dynamic part
+     * 'len', which is the remaining codeword length (the codeword length for main
+     * table entries, or the codeword length minus TABLEBITS for subtable entries).
+     *
+     * In all cases, we add 'len' to each of the two low-order bytes to create the
+     * appropriately-formatted decode table entry.  See the definitions of the
+     * *_decode_results[] arrays below, where the entry format is described.
+     */
+    fn make_decode_table_entry(&self, len: u32) -> DecodeEntry {
+        Self(self.0 | len)
+    }
+
+    const fn end_of_block() -> DecodeEntry {
+        Self(Self::ENTRY_EXCEPTIONAL | Self::ENTRY_END_OF_BLOCK)
+    }
 }
+
+// /* Shift a decode result into its position in the decode table entry.  */
+// #[inline(always)]
+// const fn huffdec_result_entry(result: u32) -> u32 {
+//     result << HUFFDEC_RESULT_SHIFT
+// }
 
 /* The decode result for each precode symbol.  There is no special optimization
  * for the precode; the decode result is simply the symbol value.  */
 #[inline(always)]
-const fn hr_entry(presym: u32) -> u32 {
-    huffdec_result_entry(presym)
+const fn hr_entry(presym: u32) -> DecodeEntry {
+    DecodeEntry::new_result(presym)
 }
 
-const PRECODE_DECODE_RESULTS: UncheckedArray<u32, DEFLATE_NUM_PRECODE_SYMS> = UncheckedArray([
-    hr_entry(0),
-    hr_entry(1),
-    hr_entry(2),
-    hr_entry(3),
-    hr_entry(4),
-    hr_entry(5),
-    hr_entry(6),
-    hr_entry(7),
-    hr_entry(8),
-    hr_entry(9),
-    hr_entry(10),
-    hr_entry(11),
-    hr_entry(12),
-    hr_entry(13),
-    hr_entry(14),
-    hr_entry(15),
-    hr_entry(16),
-    hr_entry(17),
-    hr_entry(18),
-]);
+const PRECODE_DECODE_RESULTS: UncheckedArray<DecodeEntry, DEFLATE_NUM_PRECODE_SYMS> =
+    UncheckedArray([
+        hr_entry(0),
+        hr_entry(1),
+        hr_entry(2),
+        hr_entry(3),
+        hr_entry(4),
+        hr_entry(5),
+        hr_entry(6),
+        hr_entry(7),
+        hr_entry(8),
+        hr_entry(9),
+        hr_entry(10),
+        hr_entry(11),
+        hr_entry(12),
+        hr_entry(13),
+        hr_entry(14),
+        hr_entry(15),
+        hr_entry(16),
+        hr_entry(17),
+        hr_entry(18),
+    ]);
 
 /* The decode result for each litlen symbol.  For literals, this is the literal
  * value itself and the HUFFDEC_LITERAL flag.  For lengths, this is the length
  * base and the number of extra length bits.  */
 
 #[inline(always)]
-const fn ld1_entry(literal: u32) -> u32 {
-    HUFFDEC_LITERAL | huffdec_result_entry(literal)
+const fn ld1_entry(literal: u8) -> DecodeEntry {
+    DecodeEntry::new_literal(literal)
 }
-
-pub const HUFFDEC_END_OF_BLOCK_LENGTH: u32 = 0;
-
-pub const HUFFDEC_EXTRA_LENGTH_BITS_MASK: u32 = 0xFF;
-pub const HUFFDEC_LENGTH_BASE_SHIFT: usize = 8;
 
 #[inline(always)]
-const fn ld2_entry(length_base: u32, num_extra_bits: u32) -> u32 {
-    huffdec_result_entry((length_base << HUFFDEC_LENGTH_BASE_SHIFT) | num_extra_bits)
+const fn ld2_entry(length_base: u32, num_extra_bits: u8) -> DecodeEntry {
+    DecodeEntry::new_length(length_base, num_extra_bits)
 }
 
-const LITLEN_DECODE_RESULTS: UncheckedArray<u32, DEFLATE_NUM_LITLEN_SYMS> = UncheckedArray([
-    /* Literals  */
-    ld1_entry(0),
-    ld1_entry(1),
-    ld1_entry(2),
-    ld1_entry(3),
-    ld1_entry(4),
-    ld1_entry(5),
-    ld1_entry(6),
-    ld1_entry(7),
-    ld1_entry(8),
-    ld1_entry(9),
-    ld1_entry(10),
-    ld1_entry(11),
-    ld1_entry(12),
-    ld1_entry(13),
-    ld1_entry(14),
-    ld1_entry(15),
-    ld1_entry(16),
-    ld1_entry(17),
-    ld1_entry(18),
-    ld1_entry(19),
-    ld1_entry(20),
-    ld1_entry(21),
-    ld1_entry(22),
-    ld1_entry(23),
-    ld1_entry(24),
-    ld1_entry(25),
-    ld1_entry(26),
-    ld1_entry(27),
-    ld1_entry(28),
-    ld1_entry(29),
-    ld1_entry(30),
-    ld1_entry(31),
-    ld1_entry(32),
-    ld1_entry(33),
-    ld1_entry(34),
-    ld1_entry(35),
-    ld1_entry(36),
-    ld1_entry(37),
-    ld1_entry(38),
-    ld1_entry(39),
-    ld1_entry(40),
-    ld1_entry(41),
-    ld1_entry(42),
-    ld1_entry(43),
-    ld1_entry(44),
-    ld1_entry(45),
-    ld1_entry(46),
-    ld1_entry(47),
-    ld1_entry(48),
-    ld1_entry(49),
-    ld1_entry(50),
-    ld1_entry(51),
-    ld1_entry(52),
-    ld1_entry(53),
-    ld1_entry(54),
-    ld1_entry(55),
-    ld1_entry(56),
-    ld1_entry(57),
-    ld1_entry(58),
-    ld1_entry(59),
-    ld1_entry(60),
-    ld1_entry(61),
-    ld1_entry(62),
-    ld1_entry(63),
-    ld1_entry(64),
-    ld1_entry(65),
-    ld1_entry(66),
-    ld1_entry(67),
-    ld1_entry(68),
-    ld1_entry(69),
-    ld1_entry(70),
-    ld1_entry(71),
-    ld1_entry(72),
-    ld1_entry(73),
-    ld1_entry(74),
-    ld1_entry(75),
-    ld1_entry(76),
-    ld1_entry(77),
-    ld1_entry(78),
-    ld1_entry(79),
-    ld1_entry(80),
-    ld1_entry(81),
-    ld1_entry(82),
-    ld1_entry(83),
-    ld1_entry(84),
-    ld1_entry(85),
-    ld1_entry(86),
-    ld1_entry(87),
-    ld1_entry(88),
-    ld1_entry(89),
-    ld1_entry(90),
-    ld1_entry(91),
-    ld1_entry(92),
-    ld1_entry(93),
-    ld1_entry(94),
-    ld1_entry(95),
-    ld1_entry(96),
-    ld1_entry(97),
-    ld1_entry(98),
-    ld1_entry(99),
-    ld1_entry(100),
-    ld1_entry(101),
-    ld1_entry(102),
-    ld1_entry(103),
-    ld1_entry(104),
-    ld1_entry(105),
-    ld1_entry(106),
-    ld1_entry(107),
-    ld1_entry(108),
-    ld1_entry(109),
-    ld1_entry(110),
-    ld1_entry(111),
-    ld1_entry(112),
-    ld1_entry(113),
-    ld1_entry(114),
-    ld1_entry(115),
-    ld1_entry(116),
-    ld1_entry(117),
-    ld1_entry(118),
-    ld1_entry(119),
-    ld1_entry(120),
-    ld1_entry(121),
-    ld1_entry(122),
-    ld1_entry(123),
-    ld1_entry(124),
-    ld1_entry(125),
-    ld1_entry(126),
-    ld1_entry(127),
-    ld1_entry(128),
-    ld1_entry(129),
-    ld1_entry(130),
-    ld1_entry(131),
-    ld1_entry(132),
-    ld1_entry(133),
-    ld1_entry(134),
-    ld1_entry(135),
-    ld1_entry(136),
-    ld1_entry(137),
-    ld1_entry(138),
-    ld1_entry(139),
-    ld1_entry(140),
-    ld1_entry(141),
-    ld1_entry(142),
-    ld1_entry(143),
-    ld1_entry(144),
-    ld1_entry(145),
-    ld1_entry(146),
-    ld1_entry(147),
-    ld1_entry(148),
-    ld1_entry(149),
-    ld1_entry(150),
-    ld1_entry(151),
-    ld1_entry(152),
-    ld1_entry(153),
-    ld1_entry(154),
-    ld1_entry(155),
-    ld1_entry(156),
-    ld1_entry(157),
-    ld1_entry(158),
-    ld1_entry(159),
-    ld1_entry(160),
-    ld1_entry(161),
-    ld1_entry(162),
-    ld1_entry(163),
-    ld1_entry(164),
-    ld1_entry(165),
-    ld1_entry(166),
-    ld1_entry(167),
-    ld1_entry(168),
-    ld1_entry(169),
-    ld1_entry(170),
-    ld1_entry(171),
-    ld1_entry(172),
-    ld1_entry(173),
-    ld1_entry(174),
-    ld1_entry(175),
-    ld1_entry(176),
-    ld1_entry(177),
-    ld1_entry(178),
-    ld1_entry(179),
-    ld1_entry(180),
-    ld1_entry(181),
-    ld1_entry(182),
-    ld1_entry(183),
-    ld1_entry(184),
-    ld1_entry(185),
-    ld1_entry(186),
-    ld1_entry(187),
-    ld1_entry(188),
-    ld1_entry(189),
-    ld1_entry(190),
-    ld1_entry(191),
-    ld1_entry(192),
-    ld1_entry(193),
-    ld1_entry(194),
-    ld1_entry(195),
-    ld1_entry(196),
-    ld1_entry(197),
-    ld1_entry(198),
-    ld1_entry(199),
-    ld1_entry(200),
-    ld1_entry(201),
-    ld1_entry(202),
-    ld1_entry(203),
-    ld1_entry(204),
-    ld1_entry(205),
-    ld1_entry(206),
-    ld1_entry(207),
-    ld1_entry(208),
-    ld1_entry(209),
-    ld1_entry(210),
-    ld1_entry(211),
-    ld1_entry(212),
-    ld1_entry(213),
-    ld1_entry(214),
-    ld1_entry(215),
-    ld1_entry(216),
-    ld1_entry(217),
-    ld1_entry(218),
-    ld1_entry(219),
-    ld1_entry(220),
-    ld1_entry(221),
-    ld1_entry(222),
-    ld1_entry(223),
-    ld1_entry(224),
-    ld1_entry(225),
-    ld1_entry(226),
-    ld1_entry(227),
-    ld1_entry(228),
-    ld1_entry(229),
-    ld1_entry(230),
-    ld1_entry(231),
-    ld1_entry(232),
-    ld1_entry(233),
-    ld1_entry(234),
-    ld1_entry(235),
-    ld1_entry(236),
-    ld1_entry(237),
-    ld1_entry(238),
-    ld1_entry(239),
-    ld1_entry(240),
-    ld1_entry(241),
-    ld1_entry(242),
-    ld1_entry(243),
-    ld1_entry(244),
-    ld1_entry(245),
-    ld1_entry(246),
-    ld1_entry(247),
-    ld1_entry(248),
-    ld1_entry(249),
-    ld1_entry(250),
-    ld1_entry(251),
-    ld1_entry(252),
-    ld1_entry(253),
-    ld1_entry(254),
-    ld1_entry(255),
-    /* End of block  */
-    ld2_entry(HUFFDEC_END_OF_BLOCK_LENGTH, 0),
-    /* Lengths  */
-    ld2_entry(3, 0),
-    ld2_entry(4, 0),
-    ld2_entry(5, 0),
-    ld2_entry(6, 0),
-    ld2_entry(7, 0),
-    ld2_entry(8, 0),
-    ld2_entry(9, 0),
-    ld2_entry(10, 0),
-    ld2_entry(11, 1),
-    ld2_entry(13, 1),
-    ld2_entry(15, 1),
-    ld2_entry(17, 1),
-    ld2_entry(19, 2),
-    ld2_entry(23, 2),
-    ld2_entry(27, 2),
-    ld2_entry(31, 2),
-    ld2_entry(35, 3),
-    ld2_entry(43, 3),
-    ld2_entry(51, 3),
-    ld2_entry(59, 3),
-    ld2_entry(67, 4),
-    ld2_entry(83, 4),
-    ld2_entry(99, 4),
-    ld2_entry(115, 4),
-    ld2_entry(131, 5),
-    ld2_entry(163, 5),
-    ld2_entry(195, 5),
-    ld2_entry(227, 5),
-    ld2_entry(258, 0),
-    ld2_entry(258, 0),
-    ld2_entry(258, 0),
-]);
+const LITLEN_DECODE_RESULTS: UncheckedArray<DecodeEntry, DEFLATE_NUM_LITLEN_SYMS> =
+    UncheckedArray([
+        /* Literals  */
+        ld1_entry(0),
+        ld1_entry(1),
+        ld1_entry(2),
+        ld1_entry(3),
+        ld1_entry(4),
+        ld1_entry(5),
+        ld1_entry(6),
+        ld1_entry(7),
+        ld1_entry(8),
+        ld1_entry(9),
+        ld1_entry(10),
+        ld1_entry(11),
+        ld1_entry(12),
+        ld1_entry(13),
+        ld1_entry(14),
+        ld1_entry(15),
+        ld1_entry(16),
+        ld1_entry(17),
+        ld1_entry(18),
+        ld1_entry(19),
+        ld1_entry(20),
+        ld1_entry(21),
+        ld1_entry(22),
+        ld1_entry(23),
+        ld1_entry(24),
+        ld1_entry(25),
+        ld1_entry(26),
+        ld1_entry(27),
+        ld1_entry(28),
+        ld1_entry(29),
+        ld1_entry(30),
+        ld1_entry(31),
+        ld1_entry(32),
+        ld1_entry(33),
+        ld1_entry(34),
+        ld1_entry(35),
+        ld1_entry(36),
+        ld1_entry(37),
+        ld1_entry(38),
+        ld1_entry(39),
+        ld1_entry(40),
+        ld1_entry(41),
+        ld1_entry(42),
+        ld1_entry(43),
+        ld1_entry(44),
+        ld1_entry(45),
+        ld1_entry(46),
+        ld1_entry(47),
+        ld1_entry(48),
+        ld1_entry(49),
+        ld1_entry(50),
+        ld1_entry(51),
+        ld1_entry(52),
+        ld1_entry(53),
+        ld1_entry(54),
+        ld1_entry(55),
+        ld1_entry(56),
+        ld1_entry(57),
+        ld1_entry(58),
+        ld1_entry(59),
+        ld1_entry(60),
+        ld1_entry(61),
+        ld1_entry(62),
+        ld1_entry(63),
+        ld1_entry(64),
+        ld1_entry(65),
+        ld1_entry(66),
+        ld1_entry(67),
+        ld1_entry(68),
+        ld1_entry(69),
+        ld1_entry(70),
+        ld1_entry(71),
+        ld1_entry(72),
+        ld1_entry(73),
+        ld1_entry(74),
+        ld1_entry(75),
+        ld1_entry(76),
+        ld1_entry(77),
+        ld1_entry(78),
+        ld1_entry(79),
+        ld1_entry(80),
+        ld1_entry(81),
+        ld1_entry(82),
+        ld1_entry(83),
+        ld1_entry(84),
+        ld1_entry(85),
+        ld1_entry(86),
+        ld1_entry(87),
+        ld1_entry(88),
+        ld1_entry(89),
+        ld1_entry(90),
+        ld1_entry(91),
+        ld1_entry(92),
+        ld1_entry(93),
+        ld1_entry(94),
+        ld1_entry(95),
+        ld1_entry(96),
+        ld1_entry(97),
+        ld1_entry(98),
+        ld1_entry(99),
+        ld1_entry(100),
+        ld1_entry(101),
+        ld1_entry(102),
+        ld1_entry(103),
+        ld1_entry(104),
+        ld1_entry(105),
+        ld1_entry(106),
+        ld1_entry(107),
+        ld1_entry(108),
+        ld1_entry(109),
+        ld1_entry(110),
+        ld1_entry(111),
+        ld1_entry(112),
+        ld1_entry(113),
+        ld1_entry(114),
+        ld1_entry(115),
+        ld1_entry(116),
+        ld1_entry(117),
+        ld1_entry(118),
+        ld1_entry(119),
+        ld1_entry(120),
+        ld1_entry(121),
+        ld1_entry(122),
+        ld1_entry(123),
+        ld1_entry(124),
+        ld1_entry(125),
+        ld1_entry(126),
+        ld1_entry(127),
+        ld1_entry(128),
+        ld1_entry(129),
+        ld1_entry(130),
+        ld1_entry(131),
+        ld1_entry(132),
+        ld1_entry(133),
+        ld1_entry(134),
+        ld1_entry(135),
+        ld1_entry(136),
+        ld1_entry(137),
+        ld1_entry(138),
+        ld1_entry(139),
+        ld1_entry(140),
+        ld1_entry(141),
+        ld1_entry(142),
+        ld1_entry(143),
+        ld1_entry(144),
+        ld1_entry(145),
+        ld1_entry(146),
+        ld1_entry(147),
+        ld1_entry(148),
+        ld1_entry(149),
+        ld1_entry(150),
+        ld1_entry(151),
+        ld1_entry(152),
+        ld1_entry(153),
+        ld1_entry(154),
+        ld1_entry(155),
+        ld1_entry(156),
+        ld1_entry(157),
+        ld1_entry(158),
+        ld1_entry(159),
+        ld1_entry(160),
+        ld1_entry(161),
+        ld1_entry(162),
+        ld1_entry(163),
+        ld1_entry(164),
+        ld1_entry(165),
+        ld1_entry(166),
+        ld1_entry(167),
+        ld1_entry(168),
+        ld1_entry(169),
+        ld1_entry(170),
+        ld1_entry(171),
+        ld1_entry(172),
+        ld1_entry(173),
+        ld1_entry(174),
+        ld1_entry(175),
+        ld1_entry(176),
+        ld1_entry(177),
+        ld1_entry(178),
+        ld1_entry(179),
+        ld1_entry(180),
+        ld1_entry(181),
+        ld1_entry(182),
+        ld1_entry(183),
+        ld1_entry(184),
+        ld1_entry(185),
+        ld1_entry(186),
+        ld1_entry(187),
+        ld1_entry(188),
+        ld1_entry(189),
+        ld1_entry(190),
+        ld1_entry(191),
+        ld1_entry(192),
+        ld1_entry(193),
+        ld1_entry(194),
+        ld1_entry(195),
+        ld1_entry(196),
+        ld1_entry(197),
+        ld1_entry(198),
+        ld1_entry(199),
+        ld1_entry(200),
+        ld1_entry(201),
+        ld1_entry(202),
+        ld1_entry(203),
+        ld1_entry(204),
+        ld1_entry(205),
+        ld1_entry(206),
+        ld1_entry(207),
+        ld1_entry(208),
+        ld1_entry(209),
+        ld1_entry(210),
+        ld1_entry(211),
+        ld1_entry(212),
+        ld1_entry(213),
+        ld1_entry(214),
+        ld1_entry(215),
+        ld1_entry(216),
+        ld1_entry(217),
+        ld1_entry(218),
+        ld1_entry(219),
+        ld1_entry(220),
+        ld1_entry(221),
+        ld1_entry(222),
+        ld1_entry(223),
+        ld1_entry(224),
+        ld1_entry(225),
+        ld1_entry(226),
+        ld1_entry(227),
+        ld1_entry(228),
+        ld1_entry(229),
+        ld1_entry(230),
+        ld1_entry(231),
+        ld1_entry(232),
+        ld1_entry(233),
+        ld1_entry(234),
+        ld1_entry(235),
+        ld1_entry(236),
+        ld1_entry(237),
+        ld1_entry(238),
+        ld1_entry(239),
+        ld1_entry(240),
+        ld1_entry(241),
+        ld1_entry(242),
+        ld1_entry(243),
+        ld1_entry(244),
+        ld1_entry(245),
+        ld1_entry(246),
+        ld1_entry(247),
+        ld1_entry(248),
+        ld1_entry(249),
+        ld1_entry(250),
+        ld1_entry(251),
+        ld1_entry(252),
+        ld1_entry(253),
+        ld1_entry(254),
+        ld1_entry(255),
+        /* End of block  */
+        DecodeEntry::end_of_block(),
+        /* Lengths  */
+        ld2_entry(3, 0),
+        ld2_entry(4, 0),
+        ld2_entry(5, 0),
+        ld2_entry(6, 0),
+        ld2_entry(7, 0),
+        ld2_entry(8, 0),
+        ld2_entry(9, 0),
+        ld2_entry(10, 0),
+        ld2_entry(11, 1),
+        ld2_entry(13, 1),
+        ld2_entry(15, 1),
+        ld2_entry(17, 1),
+        ld2_entry(19, 2),
+        ld2_entry(23, 2),
+        ld2_entry(27, 2),
+        ld2_entry(31, 2),
+        ld2_entry(35, 3),
+        ld2_entry(43, 3),
+        ld2_entry(51, 3),
+        ld2_entry(59, 3),
+        ld2_entry(67, 4),
+        ld2_entry(83, 4),
+        ld2_entry(99, 4),
+        ld2_entry(115, 4),
+        ld2_entry(131, 5),
+        ld2_entry(163, 5),
+        ld2_entry(195, 5),
+        ld2_entry(227, 5),
+        ld2_entry(258, 0),
+        ld2_entry(258, 0),
+        ld2_entry(258, 0),
+    ]);
 
 /* The decode result for each offset symbol.  This is the offset base and the
  * number of extra offset bits.  */
 
-pub const HUFFDEC_EXTRA_OFFSET_BITS_SHIFT: u32 = 16;
-pub const HUFFDEC_OFFSET_BASE_MASK: u32 = (1u32 << HUFFDEC_EXTRA_OFFSET_BITS_SHIFT) - 1;
-
 #[inline(always)]
-const fn odr_entry(offset_base: u32, num_extra_bits: u32) -> u32 {
-    huffdec_result_entry((num_extra_bits << HUFFDEC_EXTRA_OFFSET_BITS_SHIFT) | offset_base)
+const fn odr_entry(offset_base: u32, num_extra_bits: u8) -> DecodeEntry {
+    DecodeEntry::new_offset(offset_base, num_extra_bits)
 }
 
-const OFFSET_DECODE_RESULTS: UncheckedArray<u32, DEFLATE_NUM_OFFSET_SYMS> = UncheckedArray([
-    odr_entry(1, 0),
-    odr_entry(2, 0),
-    odr_entry(3, 0),
-    odr_entry(4, 0),
-    odr_entry(5, 1),
-    odr_entry(7, 1),
-    odr_entry(9, 2),
-    odr_entry(13, 2),
-    odr_entry(17, 3),
-    odr_entry(25, 3),
-    odr_entry(33, 4),
-    odr_entry(49, 4),
-    odr_entry(65, 5),
-    odr_entry(97, 5),
-    odr_entry(129, 6),
-    odr_entry(193, 6),
-    odr_entry(257, 7),
-    odr_entry(385, 7),
-    odr_entry(513, 8),
-    odr_entry(769, 8),
-    odr_entry(1025, 9),
-    odr_entry(1537, 9),
-    odr_entry(2049, 10),
-    odr_entry(3073, 10),
-    odr_entry(4097, 11),
-    odr_entry(6145, 11),
-    odr_entry(8193, 12),
-    odr_entry(12289, 12),
-    odr_entry(16385, 13),
-    odr_entry(24577, 13),
-    odr_entry(32769, 14),
-    odr_entry(49153, 14),
-]);
+const OFFSET_DECODE_RESULTS: UncheckedArray<DecodeEntry, DEFLATE_NUM_OFFSET_SYMS> =
+    UncheckedArray([
+        odr_entry(1, 0),
+        odr_entry(2, 0),
+        odr_entry(3, 0),
+        odr_entry(4, 0),
+        odr_entry(5, 1),
+        odr_entry(7, 1),
+        odr_entry(9, 2),
+        odr_entry(13, 2),
+        odr_entry(17, 3),
+        odr_entry(25, 3),
+        odr_entry(33, 4),
+        odr_entry(49, 4),
+        odr_entry(65, 5),
+        odr_entry(97, 5),
+        odr_entry(129, 6),
+        odr_entry(193, 6),
+        odr_entry(257, 7),
+        odr_entry(385, 7),
+        odr_entry(513, 8),
+        odr_entry(769, 8),
+        odr_entry(1025, 9),
+        odr_entry(1537, 9),
+        odr_entry(2049, 10),
+        odr_entry(3073, 10),
+        odr_entry(4097, 11),
+        odr_entry(6145, 11),
+        odr_entry(8193, 12),
+        odr_entry(12289, 12),
+        odr_entry(16385, 13),
+        odr_entry(24577, 13),
+        odr_entry(32769, 14),
+        odr_entry(49153, 14),
+    ]);
 
 #[inline(always)]
 const fn bsr32(val: u32) -> u32 {
@@ -546,19 +716,19 @@ const fn bsr32(val: u32) -> u32 {
  * valid Huffman code.
  */
 pub fn build_decode_table<const DECODE_TABLE_SIZE: usize, const DECODE_RESULTS_SIZE: usize>(
-    decode_table: &mut UncheckedArray<u32, DECODE_TABLE_SIZE>,
+    decode_table: &mut UncheckedArray<DecodeEntry, DECODE_TABLE_SIZE>,
     lens: &UncheckedSlice<LenType>,
     num_syms: usize,
-    decode_results: &UncheckedArray<u32, DECODE_RESULTS_SIZE>,
+    decode_results: &UncheckedArray<DecodeEntry, DECODE_RESULTS_SIZE>,
     table_bits: usize,
     max_codeword_len: usize,
     mut sorted_syms: *mut u16,
 ) -> bool {
-    let mut len_counts: UncheckedArray<u8, { DEFLATE_MAX_CODEWORD_LEN + 1 }> =
+    let mut len_counts: UncheckedArray<u16, { DEFLATE_MAX_CODEWORD_LEN + 1 }> =
         UncheckedArray([0; DEFLATE_MAX_CODEWORD_LEN + 1]);
     let mut offsets: UncheckedArray<u16, { DEFLATE_MAX_CODEWORD_LEN + 1 }> =
         UncheckedArray([0; DEFLATE_MAX_CODEWORD_LEN + 1]);
-    let mut count: u8; /* num codewords remaining with this length */
+    let mut count: u16; /* num codewords remaining with this length */
     let mut codespace_used: u32; /* codespace used out of '2^max_codeword_len' */
     let mut cur_table_end: usize; /* end index of current table */
     let mut subtable_prefix: usize; /* codeword prefix of current subtable */
@@ -614,6 +784,16 @@ pub fn build_decode_table<const DECODE_TABLE_SIZE: usize, const DECODE_RESULTS_S
      * considered valid only in two specific cases; see below.
      */
 
+    // if lens.len() == 19 {
+    //     let mut checker = CodepointChecker::new(lens.try_into().unwrap());
+    //     let first_len = lens[0];
+    //     let codespace = checker.roll_lens(first_len, num_syms as u8);
+
+    //     assert_eq!(codespace as u32, codespace_used);
+    // }
+
+    // println!("Precode cs: {}", codespace_used);
+
     /* overfull code? */
     if unlikely(codespace_used > (1u32 << max_codeword_len)) {
         return false;
@@ -621,15 +801,13 @@ pub fn build_decode_table<const DECODE_TABLE_SIZE: usize, const DECODE_RESULTS_S
 
     /* incomplete code? */
     if unlikely(codespace_used < (1u32 << max_codeword_len)) {
-        let entry = if codespace_used == 0 {
+        let sym = if codespace_used == 0 {
             /*
              * An empty code is allowed.  This can happen for the
              * offset code in DEFLATE, since a dynamic Huffman block
              * need not contain any matches.
              */
-
-            /* sym=0, len=1 (arbitrary) */
-            decode_results[0] | 1
+            0 // (arbitrary)
         } else {
             /*
              * Allow codes with a single used symbol, with codeword
@@ -645,8 +823,11 @@ pub fn build_decode_table<const DECODE_TABLE_SIZE: usize, const DECODE_RESULTS_S
             if codespace_used != (1u32 << (max_codeword_len - 1)) || len_counts[1] != 1 {
                 return false;
             }
-            decode_results[unsafe { *sorted_syms as usize }] | 1
+            unsafe { *sorted_syms as usize }
         };
+
+        let entry = decode_results[sym].make_decode_table_entry(1);
+
         /*
          * Note: the decode table still must be fully initialized, in
          * case the stream is malformed and contains bits from the part
@@ -695,8 +876,8 @@ pub fn build_decode_table<const DECODE_TABLE_SIZE: usize, const DECODE_RESULTS_S
         /* Process all 'count' codewords with length 'len' bits. */
         while count > 0 {
             /* Fill the first entry for the current codeword. */
-            decode_table[codeword] =
-                decode_results[unsafe { *sorted_syms as usize }] | (len as u32);
+            decode_table[codeword] = decode_results[unsafe { *sorted_syms as usize }]
+                .make_decode_table_entry(len as u32);
             unsafe {
                 sorted_syms = sorted_syms.add(1);
             }
@@ -798,13 +979,21 @@ pub fn build_decode_table<const DECODE_TABLE_SIZE: usize, const DECODE_RESULTS_S
              * which the subtable is indexed (the log base 2 of the
              * number of entries it contains).
              */
-            decode_table[subtable_prefix] = HUFFDEC_SUBTABLE_POINTER
-                | huffdec_result_entry(subtable_start as u32)
-                | subtable_bits as u32;
+
+            decode_table[subtable_prefix] = DecodeEntry::new_subtable_pointer(
+                subtable_start as u32,
+                subtable_bits as u8,
+                table_bits as u8,
+            );
+
+            // decode_table[subtable_prefix] = HUFFDEC_SUBTABLE_POINTER
+            //     | huffdec_result_entry(subtable_start as u32)
+            //     | subtable_bits as u32;
         }
 
         /* Fill the subtable entries for the current codeword. */
-        let entry = decode_results[unsafe { *sorted_syms as usize }] | (len - table_bits) as u32;
+        let entry = decode_results[unsafe { *sorted_syms as usize }]
+            .make_decode_table_entry((len - table_bits) as u32);
 
         sorted_syms = unsafe { sorted_syms.add(1) };
 

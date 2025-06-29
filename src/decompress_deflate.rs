@@ -50,6 +50,7 @@ use crate::decompress_utils::*;
 use crate::deflate_constants::*;
 use crate::unchecked::UncheckedArray;
 use crate::{DeflateInput, DeflateOutput, LibdeflateDecompressor, LibdeflateError};
+use nightly_quirks::branch_pred::likely;
 use nightly_quirks::branch_pred::unlikely;
 
 pub const PRECODE_TABLEBITS: usize = 7;
@@ -107,7 +108,7 @@ pub(crate) struct _DecStruct {
         LenType,
         { DEFLATE_NUM_LITLEN_SYMS + DEFLATE_NUM_OFFSET_SYMS + DEFLATE_MAX_LENS_OVERRUN },
     >,
-    pub(crate) precode_decode_table: UncheckedArray<u32, PRECODE_ENOUGH>,
+    pub(crate) precode_decode_table: UncheckedArray<DecodeEntry, PRECODE_ENOUGH>,
 }
 
 /*
@@ -158,63 +159,78 @@ fn decode_block_instruction<I: DeflateInput, C>(
     tmp_data
         .input_bitstream
         .ensure_bits(DEFLATE_MAX_LITLEN_CODEWORD_LEN);
-    let mut entry = d.litlen_decode_table[tmp_data.input_bitstream.bits(LITLEN_TABLEBITS) as usize];
-    if (entry & HUFFDEC_SUBTABLE_POINTER) != 0 {
-        /* Litlen subtable required (uncommon case)  */
-        tmp_data.input_bitstream.remove_bits(LITLEN_TABLEBITS);
-        entry = d.litlen_decode_table[(((entry >> HUFFDEC_RESULT_SHIFT) & 0xFFFF)
-            + tmp_data
-                .input_bitstream
-                .bits((entry & HUFFDEC_LENGTH_MASK) as usize))
-            as usize];
-    }
-    tmp_data
-        .input_bitstream
-        .remove_bits((entry & HUFFDEC_LENGTH_MASK) as usize);
-    if (entry & HUFFDEC_LITERAL) != 0 {
+    tmp_data.entry =
+        d.litlen_decode_table[tmp_data.input_bitstream.bits(LITLEN_TABLEBITS) as usize];
+
+    // Fast literal match
+    if likely(tmp_data.entry.is_literal()) {
         /* Literal  */
-        literal_cb(context, (entry >> HUFFDEC_RESULT_SHIFT) as u8)?;
+        tmp_data
+            .input_bitstream
+            .remove_bits(tmp_data.entry.get_maintable_length() as usize);
+        literal_cb(context, tmp_data.entry.get_literal())?;
+
         return Ok(true);
     }
 
-    /* Match or end-of-block  */
+    if unlikely(tmp_data.entry.is_exceptional()) {
+        if unlikely(tmp_data.entry.is_subtable_pointer()) {
+            /* Litlen subtable required (uncommon case)  */
+            tmp_data.input_bitstream.remove_bits(LITLEN_TABLEBITS);
+            tmp_data.entry = d.litlen_decode_table[(tmp_data.entry.get_result()
+                + tmp_data
+                    .input_bitstream
+                    .bits(tmp_data.entry.get_subtable_length() as usize))
+                as usize];
+        }
+        if tmp_data.entry.is_literal() {
+            /* Literal  */
+            tmp_data
+                .input_bitstream
+                .remove_bits(tmp_data.entry.get_maintable_length() as usize);
+            literal_cb(context, tmp_data.entry.get_literal())?;
+            return Ok(true);
+        }
 
-    entry >>= HUFFDEC_RESULT_SHIFT;
+        /* end-of-block  */
+        if unlikely(tmp_data.entry.is_end_of_block()) {
+            tmp_data
+                .input_bitstream
+                .remove_bits(tmp_data.entry.get_maintable_length() as usize);
+            return Ok(false);
+        }
+    }
+
+    tmp_data
+        .input_bitstream
+        .remove_bits(tmp_data.entry.get_maintable_length() as usize);
+
+    /* Match  */
     tmp_data.input_bitstream.ensure_bits(MAX_ENSURE);
 
     /* Pop the extra length bits and add them to the length base to
      * produce the full length.  */
-    let length = (entry >> HUFFDEC_LENGTH_BASE_SHIFT)
+    let length = tmp_data.entry.get_result()
         + tmp_data
             .input_bitstream
-            .pop_bits((entry & HUFFDEC_EXTRA_LENGTH_BITS_MASK) as usize);
-
-    /* The match destination must not end after the end of the
-     * output buffer.  For efficiency, combine this check with the
-     * end-of-block check.  We're using 0 for the special
-     * end-of-block length, so subtract 1 and it turn it into
-     * SIZE_MAX.  */
-    const_assert!(HUFFDEC_END_OF_BLOCK_LENGTH == 0);
-    if unlikely(length == HUFFDEC_END_OF_BLOCK_LENGTH) {
-        return Ok(false);
-    }
+            .pop_bits(tmp_data.entry.get_subtable_length() as usize);
 
     /* Decode the match offset.  */
 
-    entry = d.offset_decode_table[tmp_data.input_bitstream.bits(OFFSET_TABLEBITS) as usize];
-    if (entry & HUFFDEC_SUBTABLE_POINTER) != 0 {
+    tmp_data.entry =
+        d.offset_decode_table[tmp_data.input_bitstream.bits(OFFSET_TABLEBITS) as usize];
+    if unlikely(tmp_data.entry.is_subtable_pointer()) {
         /* Offset subtable required (uncommon case)  */
         tmp_data.input_bitstream.remove_bits(OFFSET_TABLEBITS);
-        entry = d.offset_decode_table[(((entry >> HUFFDEC_RESULT_SHIFT) & 0xFFFF)
+        tmp_data.entry = d.offset_decode_table[(tmp_data.entry.get_result()
             + tmp_data
                 .input_bitstream
-                .bits((entry & HUFFDEC_LENGTH_MASK) as usize))
+                .bits(tmp_data.entry.get_subtable_length() as usize))
             as usize];
     }
     tmp_data
         .input_bitstream
-        .remove_bits((entry & HUFFDEC_LENGTH_MASK) as usize);
-    entry >>= HUFFDEC_RESULT_SHIFT;
+        .remove_bits(tmp_data.entry.get_maintable_length() as usize);
 
     const_assert!(
         can_ensure(DEFLATE_MAX_EXTRA_LENGTH_BITS + DEFLATE_MAX_OFFSET_CODEWORD_LEN)
@@ -232,10 +248,10 @@ fn decode_block_instruction<I: DeflateInput, C>(
 
     /* Pop the extra offset bits and add them to the offset base to
      * produce the full offset.  */
-    let offset = (entry & HUFFDEC_OFFSET_BASE_MASK)
+    let offset = tmp_data.entry.get_result()
         + tmp_data
             .input_bitstream
-            .pop_bits((entry >> HUFFDEC_EXTRA_OFFSET_BITS_SHIFT) as usize);
+            .pop_bits(tmp_data.entry.get_subtable_length() as usize);
 
     /*
      * Copy the match: 'length' bytes at 'out_next - offset' to
@@ -343,19 +359,13 @@ pub(crate) fn deflate_decompress_template<I: DeflateInput, C>(
         num_litlen_syms: 0,
         num_offset_syms: 0,
         input_bitstream: BitStream::new(in_stream),
+        entry: DecodeEntry::DEFAULT,
     };
-
-    let start = std::time::Instant::now();
-
-    let mut decode_time = Duration::ZERO;
-    let mut loop_time = Duration::ZERO;
 
     'block_done: loop {
         if tmp_data.is_final_block {
             break;
         }
-
-        let decode_time_start = start.elapsed();
 
         /* Starting to read the next block.  */
         decode_huffman_header(&mut tmp_data);
@@ -388,12 +398,12 @@ pub(crate) fn deflate_decompress_template<I: DeflateInput, C>(
             }
         }
 
-        decode_time += start.elapsed() - decode_time_start;
-        let loop_time_start = start.elapsed();
+        let mut count = 0;
 
         /* The main DEFLATE decode loop  */
         'main_loop: loop {
             loop {
+                count += 1;
                 if !decode_block_instruction(d, &mut tmp_data, context, literal_cb, backref_cb)? {
                     break 'main_loop;
                 }
@@ -406,7 +416,6 @@ pub(crate) fn deflate_decompress_template<I: DeflateInput, C>(
             }
             flush_cb(context)?;
         }
-        loop_time += start.elapsed() - loop_time_start;
     }
 
     flush_cb(context)?;

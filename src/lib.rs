@@ -21,6 +21,7 @@ use crate::decompress_deflate::{
     LenType, OutStreamResult, _DecStruct, LITLEN_ENOUGH, OFFSET_ENOUGH,
 };
 use crate::decompress_gzip::libdeflate_gzip_decompress;
+use crate::decompress_utils::DecodeEntry;
 use crate::deflate_constants::{DEFLATE_MAX_NUM_SYMS, DEFLATE_NUM_PRECODE_SYMS};
 use crate::streams::deflate_chunked_buffer_output::DeflateChunkedBufferOutput;
 use crate::streams::deflate_filebuffer_input::DeflateFileBufferInput;
@@ -37,9 +38,9 @@ use std::path::Path;
 pub struct LibdeflateDecompressor {
     pub(crate) precode_lens: UncheckedArray<LenType, DEFLATE_NUM_PRECODE_SYMS>,
     pub(crate) l: _DecStruct,
-    pub(crate) litlen_decode_table: UncheckedArray<u32, LITLEN_ENOUGH>,
+    pub(crate) litlen_decode_table: UncheckedArray<DecodeEntry, LITLEN_ENOUGH>,
 
-    pub(crate) offset_decode_table: UncheckedArray<u32, OFFSET_ENOUGH>,
+    pub(crate) offset_decode_table: UncheckedArray<DecodeEntry, OFFSET_ENOUGH>,
 
     /* used only during build_decode_table() */
     pub(crate) sorted_syms: UncheckedArray<u16, DEFLATE_MAX_NUM_SYMS>,
