@@ -19,9 +19,6 @@ mod utils;
 #[macro_use]
 extern crate static_assertions;
 
-#[macro_use]
-extern crate mt_debug_counters;
-
 use crate::decompress_deflate::{
     HuffmanDecodeStruct, OutStreamResult, FAST_TABLESIZE, LITLEN_SUBTABLESIZE, LITLEN_TABLESIZE,
     OFFSET_SUBTABLESIZE, OFFSET_TABLESIZE,
@@ -118,11 +115,14 @@ pub trait DeflateInput {
 
 pub trait DeflateOutput {
     const MAX_LOOK_BACK: usize = 32768;
+    const OVERWRITE_MAX: usize = 16;
 
-    fn copy_forward(&mut self, prev_offset: usize, length: usize) -> bool;
-    fn write(&mut self, data: &[u8]) -> bool;
-    fn get_available_buffer(&mut self) -> &mut [u8];
-    unsafe fn advance_available_buffer_position(&mut self, offset: usize);
+    fn has_writable_length(&mut self, length: usize) -> bool;
+    fn flush_ensure_length(&mut self, length: usize) -> bool;
+
+    fn get_output_ptr(&mut self) -> *mut u8;
+    unsafe fn set_output_ptr(&mut self, ptr: *mut u8);
+
     fn final_flush(&mut self) -> Result<OutStreamResult, ()>;
 }
 

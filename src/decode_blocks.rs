@@ -1,5 +1,5 @@
 use crate::{
-    bitstream::{can_ensure, BitStream},
+    bitstream::can_ensure,
     decompress_deflate::{LenType, PRECODE_TABLEBITS},
     decompress_utils::{
         build_fast_decode_table, build_litlen_decode_table, build_offset_decode_table,
@@ -10,7 +10,7 @@ use crate::{
         DEFLATE_BLOCKTYPE_UNCOMPRESSED, DEFLATE_MAX_LENS_OVERRUN, DEFLATE_MAX_PRE_CODEWORD_LEN,
         DEFLATE_NUM_LITLEN_SYMS, DEFLATE_NUM_OFFSET_SYMS, DEFLATE_NUM_PRECODE_SYMS,
     },
-    safety_check, DeflateInput, LibdeflateDecodeTables, LibdeflateError,
+    safety_check, DeflateInput, DeflateOutput, LibdeflateDecodeTables, LibdeflateError,
 };
 
 #[inline(always)]
@@ -20,8 +20,6 @@ pub fn decode_huffman_header_flags<I: DeflateInput>(tmp_data: &mut DecompressTem
         .input_bitstream
         .ensure_bits::<true>(1 + 2 + 5 + 5 + 4);
 
-    // let possible_start = tmp_data.input_bitstream.bit_position();
-
     /* BFINAL: 1 bit  */
     tmp_data.is_final_block = tmp_data.input_bitstream.pop_bits(1) != 0;
 
@@ -30,11 +28,10 @@ pub fn decode_huffman_header_flags<I: DeflateInput>(tmp_data: &mut DecompressTem
 }
 
 #[inline(always)]
-pub fn decode_huffman_block<I: DeflateInput, C>(
+pub fn decode_huffman_block<I: DeflateInput, O: DeflateOutput>(
     tables: &mut LibdeflateDecodeTables,
     tmp_data: &mut DecompressTempData<I>,
-    context: &mut C,
-    uncompressed_cb: fn(&mut C, &mut BitStream<I>, usize) -> Result<(), LibdeflateError>,
+    output: &mut O,
 ) -> Result<bool, LibdeflateError> {
     /* Starting to read the next block.  */
     decode_huffman_header_flags(tmp_data);
@@ -46,7 +43,7 @@ pub fn decode_huffman_block<I: DeflateInput, C>(
     } else if tmp_data.block_type == DEFLATE_BLOCKTYPE_UNCOMPRESSED {
         /* Uncompressed block: copy 'len' bytes literally from the input
          * buffer to the output buffer.  */
-        decode_uncompressed_block(tmp_data, context, uncompressed_cb)?;
+        decode_uncompressed_block(tmp_data, output)?;
         return Ok(true);
     } else {
         safety_check!(tmp_data.block_type == DEFLATE_BLOCKTYPE_STATIC_HUFFMAN);
@@ -63,7 +60,7 @@ pub fn decode_huffman_block<I: DeflateInput, C>(
 
         if !tables.static_codes_loaded {
             tables.static_codes_loaded = true;
-            load_static_huffman_block(tables, tmp_data);
+            load_static_huffman_block(tables);
         }
     }
 
@@ -83,16 +80,13 @@ pub fn decode_dynamic_huffman_block<I: DeflateInput>(
     /* Read the codeword length counts.  */
 
     const_assert!(DEFLATE_NUM_LITLEN_SYMS == ((1 << 5) - 1) + 257);
-    tmp_data.num_litlen_syms = (tmp_data.input_bitstream.pop_bits(5) + 257) as usize;
-    // println!("num_litlen_syms: {}", tmp_data.num_litlen_syms);
+    let num_litlen_syms = (tmp_data.input_bitstream.pop_bits(5) + 257) as usize;
 
     const_assert!(DEFLATE_NUM_OFFSET_SYMS == ((1 << 5) - 1) + 1);
-    tmp_data.num_offset_syms = (tmp_data.input_bitstream.pop_bits(5) + 1) as usize;
-    // println!("num_offset_syms: {}", tmp_data.num_offset_syms);
+    let num_offset_syms = (tmp_data.input_bitstream.pop_bits(5) + 1) as usize;
 
     const_assert!(DEFLATE_NUM_PRECODE_SYMS == ((1 << 4) - 1) + 4);
     let num_explicit_precode_lens = (tmp_data.input_bitstream.pop_bits(4) + 4) as usize;
-    // println!("num_explicit_precode_lens: {}", num_explicit_precode_lens);
 
     /* Read the precode codeword lengths.  */
     const_assert!(DEFLATE_MAX_PRE_CODEWORD_LEN == (1 << 3) - 1);
@@ -102,10 +96,6 @@ pub fn decode_dynamic_huffman_block<I: DeflateInput>(
         tmp_data.input_bitstream.ensure_bits::<true>(3);
         tables.huffman_decode.precode_lens[DEFLATE_PRECODE_LENS_PERMUTATION[i] as usize] =
             tmp_data.input_bitstream.pop_bits(3) as u8;
-        // println!(
-        //     "Precode len: {}",
-        //     d.precode_lens[DEFLATE_PRECODE_LENS_PERMUTATION[i] as usize]
-        // );
     }
 
     // println!("Precode lens: {:?}", d.precode_lens);
@@ -119,7 +109,7 @@ pub fn decode_dynamic_huffman_block<I: DeflateInput>(
 
     /* Expand the literal/length and offset codeword lengths.  */
     let mut i = 0;
-    while i < tmp_data.num_litlen_syms + tmp_data.num_offset_syms {
+    while i < num_litlen_syms + num_offset_syms {
         tmp_data
             .input_bitstream
             .ensure_bits::<true>(DEFLATE_MAX_PRE_CODEWORD_LEN + 7);
@@ -204,13 +194,13 @@ pub fn decode_dynamic_huffman_block<I: DeflateInput>(
 
     safety_check!(build_offset_decode_table(
         tables,
-        tmp_data.num_litlen_syms,
-        tmp_data.num_offset_syms,
+        num_litlen_syms,
+        num_offset_syms,
     ));
     safety_check!(build_litlen_decode_table(
         tables,
-        tmp_data.num_litlen_syms,
-        tmp_data.num_offset_syms,
+        num_litlen_syms,
+        num_offset_syms,
     ));
 
     build_fast_decode_table(
@@ -224,10 +214,9 @@ pub fn decode_dynamic_huffman_block<I: DeflateInput>(
 }
 
 #[inline(always)]
-pub fn decode_uncompressed_block<I: DeflateInput, C>(
+pub fn decode_uncompressed_block<I: DeflateInput, O: DeflateOutput>(
     tmp_data: &mut DecompressTempData<I>,
-    context: &mut C,
-    uncompressed_cb: fn(&mut C, &mut BitStream<I>, usize) -> Result<(), LibdeflateError>,
+    out_stream: &mut O,
 ) -> Result<(), LibdeflateError> {
     tmp_data.input_bitstream.align_input()?;
 
@@ -236,16 +225,13 @@ pub fn decode_uncompressed_block<I: DeflateInput, C>(
 
     safety_check!(len == !nlen);
 
-    uncompressed_cb(context, &mut tmp_data.input_bitstream, len as usize)?;
+    // uncompressed_cb(context, &mut tmp_data.input_bitstream, len as usize)?;
 
-    // todo!();
+    todo!();
     Ok(())
 }
 
-pub fn load_static_huffman_block<I: DeflateInput>(
-    tables: &mut LibdeflateDecodeTables,
-    tmp_data: &mut DecompressTempData<I>,
-) {
+pub fn load_static_huffman_block(tables: &mut LibdeflateDecodeTables) {
     const_assert!(DEFLATE_NUM_LITLEN_SYMS == 288);
     const_assert!(DEFLATE_NUM_OFFSET_SYMS == 32);
 
@@ -266,15 +252,10 @@ pub fn load_static_huffman_block<I: DeflateInput>(
         tables.huffman_decode.lens[i] = 5;
     }
 
-    tmp_data.num_litlen_syms = DEFLATE_NUM_LITLEN_SYMS;
-    tmp_data.num_offset_syms = DEFLATE_NUM_OFFSET_SYMS;
-
     // Cannot fail
-    let res1 =
-        build_offset_decode_table(tables, tmp_data.num_litlen_syms, tmp_data.num_offset_syms);
+    let res1 = build_offset_decode_table(tables, DEFLATE_NUM_LITLEN_SYMS, DEFLATE_NUM_OFFSET_SYMS);
     debug_assert!(res1);
-    let res2 =
-        build_litlen_decode_table(tables, tmp_data.num_litlen_syms, tmp_data.num_offset_syms);
+    let res2 = build_litlen_decode_table(tables, DEFLATE_NUM_LITLEN_SYMS, DEFLATE_NUM_OFFSET_SYMS);
     debug_assert!(res2);
     build_fast_decode_table(
         &tables.litlen_decode_table,

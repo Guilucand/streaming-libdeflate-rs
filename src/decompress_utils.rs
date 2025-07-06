@@ -32,8 +32,8 @@ use crate::bitstream::BitStream;
  * which they have to fill less often.
  */
 use crate::decompress_deflate::{
-    decompress_direct, LenType, FAST_TABLEBITS, FAST_TABLESIZE, LITLEN_SUBTABLESIZE,
-    LITLEN_TABLEBITS, LITLEN_TABLESIZE, OFFSET_SUBTABLESIZE, OFFSET_TABLEBITS, OFFSET_TABLESIZE,
+    LenType, FAST_TABLEBITS, FAST_TABLESIZE, LITLEN_SUBTABLESIZE, LITLEN_TABLEBITS,
+    LITLEN_TABLESIZE, OFFSET_SUBTABLESIZE, OFFSET_TABLEBITS, OFFSET_TABLESIZE,
     PRECODE_SUBTABLESIZE, PRECODE_TABLEBITS, PRECODE_TABLESIZE,
 };
 use crate::decompress_utils::decode_entry::DecodeEntry;
@@ -43,12 +43,17 @@ use crate::unchecked::{UncheckedArray, UncheckedSlice};
 use crate::{DeflateInput, DeflateOutput, LibdeflateDecodeTables, LibdeflateError};
 use nightly_quirks::branch_pred::unlikely;
 
+#[derive(Default, Copy, Clone)]
+pub struct DecodeEntryState {
+    pub entry: FastDecodeEntry,
+    pub offset: usize,
+}
+
 pub struct DecompressTempData<'a, I: DeflateInput> {
     pub input_bitstream: BitStream<'a, I>,
-    pub num_litlen_syms: usize,
-    pub num_offset_syms: usize,
     pub block_type: u32,
     pub is_final_block: bool,
+    pub last_state: DecodeEntryState,
 }
 
 /*****************************************************************************
@@ -494,8 +499,6 @@ pub fn build_fast_decode_table(
     // Reset the temp indices
     temp_indices_litlen.clear();
 
-    let mut fast_entries = 0;
-
     // Init the table with the default litlen values
     for (codeword, (fast_entry, litlen)) in fast_table
         .0
@@ -509,7 +512,6 @@ pub fn build_fast_decode_table(
 
         if !litlen.is_exceptional() {
             if litlen.is_literal() {
-                fast_entries += 1;
                 temp_indices_litlen.push(TempFastDecodeBuild {
                     codeword,
                     new_entry: litlen_decode_table[shifted_codeword],
@@ -519,7 +521,6 @@ pub fn build_fast_decode_table(
                 let offset_bits = offset_entry.get_maintable_length() as usize;
                 if used_bits + offset_bits <= FAST_TABLEBITS && !offset_entry.is_exceptional() {
                     fast_entry.add_offset_entry(offset_entry);
-                    fast_entries += 1;
                 }
             }
         }
@@ -573,12 +574,16 @@ pub fn build_fast_decode_table(
         });
     }
 
-    // let mut exc_count = 0;
+    // // let mut exc_count = 0;
     // for codeword in 0..(1 << FAST_TABLEBITS) {
     //     if fast_table[codeword].get_len_value() != 0 && fast_table[codeword].get_flags() == 0 {
     //         assert!(fast_table[codeword].get_offset_value() > 0);
     //     }
-    //     exc_count += (fast_table[codeword].get_flags() != 0) as usize;
+    //     if fast_table[codeword].get_flags() == 0 {
+    //         assert!(fast_table[codeword].get_literals_count() <= 2);
+    //     }
+
+    //     // exc_count += (fast_table[codeword].get_flags() != 0) as usize;
     // }
 
     // println!("Exceptional: {} / {}", exc_count, 1 << FAST_TABLEBITS);
@@ -922,23 +927,6 @@ pub fn build_offset_decode_table(
         DEFLATE_MAX_OFFSET_CODEWORD_LEN,
         &mut d.sorted_syms,
     );
-}
-
-/*
- * This is the main DEFLATE decompression routine.  See libdeflate.h for the
- * documentation.
- *
- * Note that the real code is in decompress_template.h.  The part here just
- * handles calling the appropriate implementation depending on the CPU features
- * at runtime.
- */
-pub fn libdeflate_deflate_decompress<I: DeflateInput, O: DeflateOutput>(
-    d: &mut LibdeflateDecodeTables,
-    in_stream: &mut I,
-    out_stream: &mut O,
-) -> Result<(), LibdeflateError> {
-    decompress_direct(d, in_stream, out_stream)
-    // decompress_with_instr(d, in_stream, out_stream)
 }
 
 #[cfg(test)]

@@ -45,7 +45,7 @@ impl<'a> DeflateChunkedBufferInput<'a> {
         self.position -= move_offset;
         self.end_position -= move_offset;
 
-        let count = (self.func)(&mut self.buffer[self.end_position..]);
+        let count = (self.func)(&mut self.buffer[self.end_position..self.buf_size]);
 
         self.end_position += count;
 
@@ -127,17 +127,18 @@ impl<'a> DeflateInput for DeflateChunkedBufferInput<'a> {
 
     #[inline(always)]
     fn read_exact_into<O: DeflateOutput>(&mut self, out_stream: &mut O, mut length: usize) -> bool {
-        while length > 0 {
-            let buffer = out_stream.get_available_buffer();
-            let copyable = min(buffer.len(), length);
-            if self.read::<true>(&mut buffer[0..copyable]) != copyable {
-                return false;
-            }
-            unsafe {
-                out_stream.advance_available_buffer_position(copyable);
-            }
-            length -= copyable;
-        }
+        todo!();
+        // while length > 0 {
+        //     let buffer = out_stream.get_available_buffer();
+        //     let copyable = min(buffer.len(), length);
+        //     if self.read::<true>(&mut buffer[0..copyable]) != copyable {
+        //         return false;
+        //     }
+        //     unsafe {
+        //         out_stream.advance_available_buffer_position(copyable);
+        //     }
+        //     length -= copyable;
+        // }
         true
     }
 }

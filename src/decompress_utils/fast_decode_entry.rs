@@ -81,14 +81,30 @@ impl FastDecodeEntry {
         subtable_len as u16
     }
 
+    pub fn new_from_len(len: u16) -> Self {
+        Self {
+            bits: 0,
+            flags: 0,
+            len: Self::create_len(len, 0),
+            lit: 0,
+            off: 0,
+        }
+    }
+
+    pub fn new_from_literal(lit: u8) -> Self {
+        Self {
+            bits: 0,
+            flags: 0,
+            len: Self::create_len(0, 1),
+            lit: lit as u16,
+            off: 0,
+        }
+    }
+
     pub fn new_from_litlen_entry(entry: DecodeEntry, codeword: usize) -> Self {
         if entry.is_exceptional() {
             Self {
-                bits: if entry.is_subtable_pointer() {
-                    entry.get_result() as u8 // Subtable
-                } else {
-                    Self::create_bits(0, entry.get_maintable_length())
-                },
+                bits: Self::create_bits(0, entry.get_maintable_length()),
                 flags: if entry.is_subtable_pointer() {
                     Self::EXC_LEN_SUBTABLE
                 } else {
@@ -96,7 +112,11 @@ impl FastDecodeEntry {
                 },
                 len: Self::create_extra_len(entry.get_subtable_length()),
                 lit: 0,
-                off: 0,
+                off: if entry.is_subtable_pointer() {
+                    entry.get_result() as u16 // Subtable
+                } else {
+                    0
+                },
             }
         } else {
             if entry.is_literal() {
@@ -104,7 +124,7 @@ impl FastDecodeEntry {
                     bits: Self::create_bits(0, entry.get_maintable_length()),
                     flags: 0,
                     len: Self::create_len(0, 1), // 1 literal
-                    lit: 0,
+                    lit: entry.get_literal() as u16,
                     off: 0,
                 }
             } else {
@@ -142,8 +162,10 @@ impl FastDecodeEntry {
         }
     }
 
-    pub const fn maybe_add_litlen_entry(&mut self, entry: DecodeEntry, codeword: usize) -> bool {
+    pub fn maybe_add_litlen_entry(&mut self, entry: DecodeEntry, codeword: usize) -> bool {
         debug_assert!(!entry.is_exceptional());
+
+        assert!(self.get_literals_count() <= Self::MAX_LITERALS);
 
         if entry.is_literal() {
             if self.get_literals_count() >= Self::MAX_LITERALS {
@@ -152,14 +174,14 @@ impl FastDecodeEntry {
             }
 
             // Add the literal
-            self.lit <<= 8;
-            self.lit |= entry.get_literal() as u16;
+            self.lit |= (entry.get_literal() as u16) << (self.get_literals_count() * 8);
             // Increment the literals count
             self.inc_literals_count();
 
             // Increment the used bits
             self.inc_consumed_bits(entry.get_maintable_length());
 
+            assert!(self.get_literals_count() <= Self::MAX_LITERALS);
             true
         } else {
             // Length match
@@ -172,6 +194,7 @@ impl FastDecodeEntry {
             self.inc_len_value(total_len);
             self.inc_consumed_bits(entry.get_maintable_length() + entry.get_subtable_length());
             self.flags = Self::EXC_LEN_FULLSIZE;
+            assert!(self.get_literals_count() <= Self::MAX_LITERALS);
             true
         }
     }
@@ -180,11 +203,14 @@ impl FastDecodeEntry {
         self.inc_consumed_bits(entry.get_maintable_length());
         self.inc_offset_bits(entry.get_subtable_length());
         self.set_offset_value(entry.get_result() as u16);
+
+        assert!(self.get_literals_count() <= Self::MAX_LITERALS);
+
         self.flags = 0; // Normal entry
     }
 
     pub const fn get_subtable_index(&self) -> u32 {
-        self.bits as u32
+        self.off as u32
     }
 
     pub fn get_subtable_length(&self) -> usize {

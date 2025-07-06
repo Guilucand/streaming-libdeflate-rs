@@ -307,6 +307,14 @@ mod tests {
 
         println!("Started!");
 
+        // if lens.len() == 19 {
+        //     let mut checker = CodepointChecker::new(lens.try_into().unwrap());
+        //     let first_len = lens[0];
+        //     let codespace = checker.roll_lens(first_len, num_syms as u8);
+
+        //     assert_eq!(codespace as u32, codespace_used);
+        // }
+
         let mut bytes_count = 16;
         let mut blocks_count = 0;
 

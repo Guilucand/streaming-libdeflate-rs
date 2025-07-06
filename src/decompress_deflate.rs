@@ -37,16 +37,10 @@
  * corresponding ENOUGH number!
  */
 
-use std::time::Duration;
-
 use crate::bitstream::can_ensure;
 use crate::bitstream::BitStream;
 use crate::bitstream::MAX_ENSURE;
-use crate::decode_blocks::decode_dynamic_huffman_block;
 use crate::decode_blocks::decode_huffman_block;
-use crate::decode_blocks::decode_huffman_header_flags;
-use crate::decode_blocks::decode_uncompressed_block;
-use crate::decode_blocks::load_static_huffman_block;
 use crate::decompress_utils::decode_entry::DecodeEntry;
 use crate::decompress_utils::fast_decode_entry::FastDecodeEntry;
 use crate::decompress_utils::*;
@@ -146,40 +140,93 @@ pub(crate) struct HuffmanDecodeStruct {
  * target instruction sets.
  */
 
-#[inline(never)]
-fn process_instructions<O: DeflateOutput>(
-    instructions: &mut Vec<u16>,
-    output_stream: &mut O,
-) -> Result<(), LibdeflateError> {
-    // return Ok(());
-    let mut instr_idx = 0;
-    while instr_idx < instructions.len() {
-        let instruction = instructions[instr_idx];
+// #[inline(never)]
+// fn process_instructions<O: DeflateOutput>(
+//     instructions: &mut Vec<u16>,
+//     output_stream: &mut O,
+// ) -> Result<(), LibdeflateError> {
+//     // return Ok(());
+//     let mut instr_idx = 0;
+//     while instr_idx < instructions.len() {
+//         let instruction = instructions[instr_idx];
 
-        if instruction & 0xFF00 == 0xFF00 {
-            // Literal
-            let literal = (instruction & 0x00FF) as u8;
-            safety_check!(output_stream.write(&[literal]));
-        } else {
-            // Match
-            let length = instruction as usize;
-            instr_idx += 1; // Move to the next instruction for offset
-            let offset = instructions[instr_idx] as usize;
+//         if instruction & 0xFF00 == 0xFF00 {
+//             // Literal
+//             let literal = (instruction & 0x00FF) as u8;
+//             safety_check!(output_stream.write(&[literal]));
+//         } else {
+//             // Match
+//             let length = instruction as usize;
+//             instr_idx += 1; // Move to the next instruction for offset
+//             let offset = instructions[instr_idx] as usize;
 
-            safety_check!(output_stream.copy_forward(offset, length));
+//             todo!();
+//             safety_check!(output_stream.copy_forward(offset, length));
+//         }
+
+//         instr_idx += 1;
+//     }
+
+//     instructions.clear();
+//     Ok(())
+// }
+
+#[inline(always)]
+fn process_entry(state: DecodeEntryState, output_stream: &mut impl DeflateOutput) {
+    unsafe {
+        let mut out_ptr = output_stream.get_output_ptr();
+        (out_ptr as *mut u16).write_unaligned(state.entry.get_literals());
+        out_ptr = out_ptr.add(state.entry.get_literals_count() as usize);
+
+        let mut src = out_ptr.sub(state.offset) as *const u64;
+        let mut dst = out_ptr as *mut u64;
+
+        let word = std::ptr::read_unaligned(src);
+        std::ptr::write_unaligned(dst, word);
+
+        let length = state.entry.get_len_value() as usize;
+
+        // Overlapping words
+        if unlikely(state.offset > 0 && state.offset < 8) {
+            let mut remaining = length as isize;
+            let mut src = src as *const u8;
+            let mut dst = dst as *mut u8;
+            loop {
+                for i in 0..8 {
+                    *dst.add(i) = *src.add(i);
+                }
+                remaining -= 8;
+                if remaining <= 0 {
+                    break;
+                }
+                src = src.add(8);
+                dst = dst.add(8);
+            }
+        } else if unlikely(length > 8) {
+            let mut remaining = length as isize;
+            loop {
+                src = src.add(1);
+                dst = dst.add(1);
+                remaining -= 8;
+
+                let word = src.read_unaligned();
+                dst.write_unaligned(word);
+
+                if remaining <= 0 {
+                    break;
+                }
+            }
         }
 
-        instr_idx += 1;
+        output_stream.set_output_ptr(out_ptr.add(length));
     }
-
-    instructions.clear();
-    Ok(())
 }
 
 #[inline(always)]
-fn decode_block_instruction<I: DeflateInput>(
+fn decode_block_instruction<I: DeflateInput, O: DeflateOutput, const FIRST_ENTRY: bool>(
     tables: &LibdeflateDecodeTables,
     tmp_data: &mut DecompressTempData<I>,
+    output_stream: &mut O,
 ) -> Result<bool, LibdeflateError> {
     tmp_data.input_bitstream.force_ensure_bits();
 
@@ -187,15 +234,48 @@ fn decode_block_instruction<I: DeflateInput>(
     let mut fast_entry =
         tables.fast_decode_table[tmp_data.input_bitstream.bits(FAST_TABLEBITS) as usize];
 
+    if !FIRST_ENTRY {
+        process_entry(tmp_data.last_state, output_stream);
+    }
+
     if likely(fast_entry.get_flags() == 0) {
-        let tot_bits = fast_entry.get_offset_bits() + fast_entry.get_consumed_bits();
+        let offset_bits = fast_entry.get_offset_bits();
+        let consumed_bits = fast_entry.get_consumed_bits();
+
+        tmp_data.last_state = DecodeEntryState {
+            entry: fast_entry,
+            offset: fast_entry.get_offset_value() as usize
+                + tmp_data
+                    .input_bitstream
+                    .bits_with_offset(consumed_bits, offset_bits) as usize,
+        };
+
+        let tot_bits = offset_bits + consumed_bits;
         tmp_data.input_bitstream.remove_bits(tot_bits as usize);
 
         fast_entry =
             tables.fast_decode_table[tmp_data.input_bitstream.bits(FAST_TABLEBITS) as usize];
 
+        if !FIRST_ENTRY {
+            process_entry(tmp_data.last_state, output_stream);
+        } else {
+            return Ok(true);
+        }
+
         if likely(fast_entry.get_flags() == 0) {
-            let tot_bits = fast_entry.get_offset_bits() + fast_entry.get_consumed_bits();
+            let offset_bits = fast_entry.get_offset_bits();
+            let consumed_bits = fast_entry.get_consumed_bits();
+
+            tmp_data.last_state = DecodeEntryState {
+                entry: fast_entry,
+                offset: fast_entry.get_offset_value() as usize
+                    + tmp_data
+                        .input_bitstream
+                        .bits_with_offset(consumed_bits, offset_bits)
+                        as usize,
+            };
+
+            let tot_bits = offset_bits + consumed_bits;
             tmp_data.input_bitstream.remove_bits(tot_bits as usize);
             return Ok(true);
         }
@@ -211,11 +291,14 @@ fn decode_block_instruction<I: DeflateInput>(
                 .input_bitstream
                 .remove_bits(fast_entry.get_consumed_bits() as usize);
 
-            if unlikely(fast_entry.get_flags() == FastDecodeEntry::EXC_LEN_EXTRABIT) {
+            let extra_len = if unlikely(fast_entry.get_flags() == FastDecodeEntry::EXC_LEN_EXTRABIT)
+            {
                 tmp_data
                     .input_bitstream
-                    .remove_bits(fast_entry.get_exceptional_length_bits() as usize);
-            }
+                    .pop_bits(fast_entry.get_exceptional_length_bits() as usize)
+            } else {
+                0
+            };
 
             let mut offset_entry = tables.offset_decode_table
                 [tmp_data.input_bitstream.bits(OFFSET_TABLEBITS) as usize];
@@ -228,10 +311,23 @@ fn decode_block_instruction<I: DeflateInput>(
                         .bits(offset_entry.get_subtable_length() as usize))
                     as usize];
             }
-            tmp_data.input_bitstream.remove_bits(
-                offset_entry.get_maintable_length() as usize
-                    + offset_entry.get_subtable_length() as usize,
-            );
+
+            let offset_consumed = offset_entry.get_maintable_length();
+            let offset_extrabit = offset_entry.get_subtable_length();
+
+            fast_entry.inc_len_value(extra_len as u16);
+            tmp_data.last_state = DecodeEntryState {
+                entry: fast_entry,
+                offset: offset_entry.get_result() as usize
+                    + tmp_data
+                        .input_bitstream
+                        .bits_with_offset(offset_consumed, offset_extrabit)
+                        as usize,
+            };
+
+            tmp_data
+                .input_bitstream
+                .remove_bits(offset_consumed as usize + offset_extrabit as usize);
 
             return Ok(true);
         }
@@ -262,6 +358,12 @@ fn decode_block_instruction<I: DeflateInput>(
         tmp_data
             .input_bitstream
             .remove_bits(entry.get_maintable_length() as usize);
+
+        tmp_data.last_state = DecodeEntryState {
+            entry: FastDecodeEntry::new_from_literal(entry.get_literal()),
+            offset: 0,
+        };
+
         // literal_cb(context, entry.get_literal())?;
         tmp_data
             .input_bitstream
@@ -319,154 +421,72 @@ fn decode_block_instruction<I: DeflateInput>(
             .input_bitstream
             .pop_bits(offset_entry.get_subtable_length() as usize);
 
-    /*
-     * Copy the match: 'length' bytes at 'out_next - offset' to
-     * 'out_next', possibly overlapping.  If the match doesn't end
-     * too close to the end of the buffer and offset >= WORDBYTES ||
-     * offset == 1, take a fast path which copies a word at a time
-     * -- potentially more than the length of the match, but that's
-     * fine as long as we check for enough extra space.
-     *
-     * The remaining cases are not performance-critical so are
-     * handled by a simple byte-by-byte copy.
-     */
-    // backref_cb(context, length as u16, offset as u16)?;
+    tmp_data.last_state = DecodeEntryState {
+        entry: FastDecodeEntry::new_from_len(length as u16),
+        offset: offset as usize,
+    };
+
     Ok(true)
 }
 
+// #[inline(never)]
+// pub fn decompress_with_instr<I: DeflateInput, O: DeflateOutput>(
+//     d: &mut LibdeflateDecodeTables,
+//     in_stream: &mut I,
+//     out_stream: &mut O,
+// ) -> Result<(), LibdeflateError> {
+//     const INSTRUCTIONS_BUFFER_SIZE: usize = 8192;
+//     let mut instructions = Vec::with_capacity(INSTRUCTIONS_BUFFER_SIZE);
+
+//     deflate_decompress_template(
+//         d,
+//         in_stream,
+//         &mut instructions,
+//         // #[inline(always)]
+//         // |instructions, input, len| Ok(()),
+//         // #[inline(always)]
+//         // |instructions, literal| unsafe {
+//         //     let len = instructions.len();
+//         //     *instructions.get_unchecked_mut(len) = (255 << 8) | (literal as u16);
+//         //     instructions.set_len(len + 1);
+
+//         //     Ok(())
+//         // },
+//         #[inline(always)]
+//         |instructions, length, offset| {
+//             unsafe {
+//                 let len = instructions.len();
+//                 *instructions.get_unchecked_mut(len) = length;
+//                 *instructions.get_unchecked_mut(len + 1) = offset;
+//                 instructions.set_len(len + 2);
+//             }
+//             Ok(())
+//         },
+//         |instructions| instructions.len() >= (INSTRUCTIONS_BUFFER_SIZE - 2),
+//         |instructions| process_instructions(instructions, out_stream),
+//     )
+// }
+
 #[inline(never)]
-pub fn decompress_with_instr<I: DeflateInput, O: DeflateOutput>(
+pub fn libdeflate_deflate_decompress<I: DeflateInput, O: DeflateOutput>(
     d: &mut LibdeflateDecodeTables,
     in_stream: &mut I,
     out_stream: &mut O,
 ) -> Result<(), LibdeflateError> {
-    const INSTRUCTIONS_BUFFER_SIZE: usize = 8192;
-    let mut instructions = Vec::with_capacity(INSTRUCTIONS_BUFFER_SIZE);
-
-    deflate_decompress_template(
-        d,
-        in_stream,
-        &mut instructions,
-        #[inline(always)]
-        |instructions, input, len| Ok(()),
-        #[inline(always)]
-        |instructions, literal| unsafe {
-            let len = instructions.len();
-            *instructions.get_unchecked_mut(len) = (255 << 8) | (literal as u16);
-            instructions.set_len(len + 1);
-
-            Ok(())
-        },
-        #[inline(always)]
-        |instructions, length, offset| {
-            unsafe {
-                let len = instructions.len();
-                *instructions.get_unchecked_mut(len) = length;
-                *instructions.get_unchecked_mut(len + 1) = offset;
-                instructions.set_len(len + 2);
-            }
-            Ok(())
-        },
-        |instructions| instructions.len() >= (INSTRUCTIONS_BUFFER_SIZE - 2),
-        |instructions| process_instructions(instructions, out_stream),
-    )
-}
-
-#[inline(never)]
-#[unsafe(no_mangle)]
-pub fn decompress_fast(d: &mut LibdeflateDecodeTables, input: &mut DeflateChunkedBufferInput) {
-    // deflate_4bit_test(d, input);
-    // std::process::exit(1);
-
-    let start = std::time::Instant::now();
-
-    deflate_decompress_template(
-        d,
-        input,
-        &mut (),
-        |out_stream, input, len| {
-            // safety_check!(input.read_exact_into(out_stream, len as usize));
-            Ok(())
-        },
-        #[inline(always)]
-        |out_stream, literal| {
-            // if !out_stream.write(&[literal]) {
-            //     return Err(LibdeflateError::InsufficientSpace);
-            // }
-            Ok(())
-        },
-        #[inline(always)]
-        |out_stream, length, offset| {
-            // safety_check!(out_stream.copy_forward(offset as usize, length as usize));
-            Ok(())
-        },
-        #[inline(always)]
-        |_| false,
-        #[inline(always)]
-        |_| Ok(()),
-    )
-    .unwrap();
-
-    println!(
-        "Decompression completed successfully in {:?}",
-        start.elapsed()
-    );
-
-    // std::process::exit(1);
-}
-
-#[inline(never)]
-pub fn decompress_direct<I: DeflateInput, O: DeflateOutput>(
-    d: &mut LibdeflateDecodeTables,
-    in_stream: &mut I,
-    out_stream: &mut O,
-) -> Result<(), LibdeflateError> {
-    deflate_decompress_template(
-        d,
-        in_stream,
-        out_stream,
-        |out_stream, input, len| {
-            // safety_check!(input.read_exact_into(out_stream, len as usize));
-            Ok(())
-        },
-        #[inline(always)]
-        |out_stream, literal| {
-            // if !out_stream.write(&[literal]) {
-            //     return Err(LibdeflateError::InsufficientSpace);
-            // }
-            Ok(())
-        },
-        #[inline(always)]
-        |out_stream, length, offset| {
-            // safety_check!(out_stream.copy_forward(offset as usize, length as usize));
-            Ok(())
-        },
-        #[inline(always)]
-        |_| true,
-        #[inline(always)]
-        |_| Ok(()),
-    )?;
-
-    Ok(())
+    deflate_decompress_template(d, in_stream, out_stream)
 }
 
 #[inline(always)]
-pub(crate) fn deflate_decompress_template<I: DeflateInput, C>(
+pub(crate) fn deflate_decompress_template<I: DeflateInput, O: DeflateOutput>(
     tables: &mut LibdeflateDecodeTables,
     in_stream: &mut I,
-    context: &mut C,
-    uncompressed_cb: fn(&mut C, &mut BitStream<I>, usize) -> Result<(), LibdeflateError>,
-    literal_cb: fn(&mut C, u8) -> Result<(), LibdeflateError>,
-    backref_cb: fn(&mut C, u16, u16) -> Result<(), LibdeflateError>,
-    call_flush: fn(&C) -> bool,
-    mut flush_cb: impl FnMut(&mut C) -> Result<(), LibdeflateError>,
+    out_stream: &mut O,
 ) -> Result<(), LibdeflateError> {
     let mut tmp_data = DecompressTempData {
         is_final_block: false,
         block_type: 0,
-        num_litlen_syms: 0,
-        num_offset_syms: 0,
         input_bitstream: BitStream::new(in_stream),
+        last_state: DecodeEntryState::default(),
     };
 
     'decompress_loop: loop {
@@ -475,37 +495,42 @@ pub(crate) fn deflate_decompress_template<I: DeflateInput, C>(
         }
 
         /* Read the next huffman block */
-        if decode_huffman_block(tables, &mut tmp_data, context, uncompressed_cb)? {
+        if decode_huffman_block(tables, &mut tmp_data, out_stream)? {
             // Decoded an uncompressed block
             continue;
         }
 
-        let mut count = 0;
+        tmp_data
+            .input_bitstream
+            .input_stream
+            .ensure_overread_length();
+        // Decode the first instruction without processing it
+        if unlikely(!decode_block_instruction::<_, _, true>(
+            tables,
+            &mut tmp_data,
+            out_stream,
+        )?) {
+            continue;
+        }
 
-        /* The main DEFLATE decode loop  */
         'main_loop: loop {
             tmp_data
                 .input_bitstream
                 .input_stream
                 .ensure_overread_length();
 
-            tmp_data.input_bitstream.ensure_bits::<false>(MAX_ENSURE);
-
             while tmp_data
                 .input_bitstream
                 .input_stream
                 .has_readable_overread()
+                && out_stream.has_writable_length(DEFLATE_MAX_MATCH_LEN * 2)
             {
-                if !decode_block_instruction(tables, &mut tmp_data)? {
+                if !decode_block_instruction::<_, _, false>(tables, &mut tmp_data, out_stream)? {
                     break 'main_loop;
-                }
-
-                if call_flush(context) {
-                    break;
                 }
             }
 
-            flush_cb(context)?;
+            out_stream.flush_ensure_length(DEFLATE_MAX_MATCH_LEN * 2);
 
             // Invalid data or eof
             if !tmp_data.input_bitstream.input_stream.has_valid_bytes_slow() {
@@ -514,7 +539,6 @@ pub(crate) fn deflate_decompress_template<I: DeflateInput, C>(
         }
     }
 
-    flush_cb(context)?;
     /* That was the last block.  */
 
     /* Discard any readahead bits and check for excessive overread */
