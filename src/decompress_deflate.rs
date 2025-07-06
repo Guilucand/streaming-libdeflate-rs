@@ -39,13 +39,10 @@
 
 use crate::bitstream::can_ensure;
 use crate::bitstream::BitStream;
-use crate::bitstream::MAX_ENSURE;
 use crate::decode_blocks::decode_huffman_block;
-use crate::decompress_utils::decode_entry::DecodeEntry;
 use crate::decompress_utils::fast_decode_entry::FastDecodeEntry;
 use crate::decompress_utils::*;
 use crate::deflate_constants::*;
-use crate::streams::deflate_chunked_buffer_input::DeflateChunkedBufferInput;
 use crate::unchecked::UncheckedArray;
 use crate::{DeflateInput, DeflateOutput, LibdeflateDecodeTables, LibdeflateError};
 use nightly_quirks::branch_pred::likely;
@@ -130,7 +127,7 @@ pub(crate) struct HuffmanDecodeStruct {
         { DEFLATE_NUM_LITLEN_SYMS + DEFLATE_NUM_OFFSET_SYMS + DEFLATE_MAX_LENS_OVERRUN },
     >,
     pub(crate) precode_lens: UncheckedArray<LenType, DEFLATE_NUM_PRECODE_SYMS>,
-    pub(crate) precode_decode_table: UncheckedArray<DecodeEntry, PRECODE_ENOUGH>,
+    pub(crate) precode_decode_table: UncheckedArray<FastDecodeEntry, PRECODE_ENOUGH>,
     pub(crate) fast_temp_litlen: Vec<TempFastDecodeBuild>,
 }
 
@@ -172,7 +169,10 @@ pub(crate) struct HuffmanDecodeStruct {
 // }
 
 #[inline(always)]
-fn process_entry(state: DecodeEntryState, output_stream: &mut impl DeflateOutput) {
+fn process_entry<const COPY_ITERS: usize, const SINGLE_BYTES: bool, const VARLEN_COPY: bool>(
+    state: DecodeEntryState,
+    output_stream: &mut impl DeflateOutput,
+) {
     unsafe {
         let mut out_ptr = output_stream.get_output_ptr();
         (out_ptr as *mut u16).write_unaligned(state.entry.get_literals());
@@ -181,13 +181,27 @@ fn process_entry(state: DecodeEntryState, output_stream: &mut impl DeflateOutput
         let mut src = out_ptr.sub(state.offset) as *const u64;
         let mut dst = out_ptr as *mut u64;
 
-        let word = std::ptr::read_unaligned(src);
-        std::ptr::write_unaligned(dst, word);
-
         let length = state.entry.get_len_value() as usize;
 
-        // Overlapping words
-        if unlikely(state.offset > 0 && state.offset < 8) {
+        if SINGLE_BYTES {
+            // if offset == 1 {
+            //     /* RLE encoding of previous byte, common if the
+            //      * data contains many repeated bytes */
+            //     let v = usize::from_ne_bytes([*src; std::mem::size_of::<usize>()]);
+
+            //     std::ptr::write_unaligned(dst as *mut usize, v);
+            //     dst = dst.add(WORD_BYTES);
+            //     std::ptr::write_unaligned(dst as *mut usize, v);
+            //     dst = dst.add(WORD_BYTES);
+            //     loop {
+            //         std::ptr::write_unaligned(dst as *mut usize, v);
+            //         dst = dst.add(WORD_BYTES);
+            //         if dst as usize >= dst_end as usize {
+            //             break;
+            //         }
+            //     }
+            // }
+
             let mut remaining = length as isize;
             let mut src = src as *const u8;
             let mut dst = dst as *mut u8;
@@ -202,24 +216,70 @@ fn process_entry(state: DecodeEntryState, output_stream: &mut impl DeflateOutput
                 src = src.add(8);
                 dst = dst.add(8);
             }
-        } else if unlikely(length > 8) {
+        } else if VARLEN_COPY {
             let mut remaining = length as isize;
             loop {
-                src = src.add(1);
-                dst = dst.add(1);
-                remaining -= 8;
-
-                let word = src.read_unaligned();
-                dst.write_unaligned(word);
+                remaining -= 16;
+                copy_word_unaligned(src, dst);
+                copy_word_unaligned(src.add(1), dst.add(1));
 
                 if remaining <= 0 {
                     break;
                 }
+                src = src.add(2);
+                dst = dst.add(2);
+            }
+        } else {
+            let mut iter_count = 0;
+
+            while iter_count < COPY_ITERS {
+                copy_word_unaligned(src, dst);
+                copy_word_unaligned(src.add(1), dst.add(1));
+
+                src = src.add(2);
+                dst = dst.add(2);
+                iter_count += 1;
             }
         }
 
         output_stream.set_output_ptr(out_ptr.add(length));
     }
+}
+
+#[inline(always)]
+fn set_next_entry<I: DeflateInput, const FAST: bool>(
+    tmp_data: &mut DecompressTempData<I>,
+    state: DecodeEntryState,
+) {
+    tmp_data.last_state = state;
+
+    // unsafe {
+    //     static mut TOT_FAST: usize = 0;
+    //     static mut TOT_SLOW: usize = 0;
+
+    //     if FAST {
+    //         TOT_FAST += 1;
+    //     }
+
+    //     if !FAST {
+    //         TOT_SLOW += 1;
+    //     }
+
+    //     static mut EXTRA_FAST: usize = 0;
+    //     static mut EXTRA_SLOW: usize = 0;
+    //     if FAST && state.entry.get_len_value() > 16 {
+    //         EXTRA_FAST += 1;
+    //     }
+    //     if !FAST && state.entry.get_len_value() > 16 {
+    //         EXTRA_SLOW += 1;
+    //     }
+    //     if TOT_FAST % 1000000 == 0 {
+    //         println!(
+    //             "Extra: SLOW: {}/{} FAST: {}/{}",
+    //             EXTRA_SLOW, TOT_SLOW, EXTRA_FAST, TOT_FAST
+    //         );
+    //     }
+    // }
 }
 
 #[inline(always)]
@@ -235,45 +295,52 @@ fn decode_block_instruction<I: DeflateInput, O: DeflateOutput, const FIRST_ENTRY
         tables.fast_decode_table[tmp_data.input_bitstream.bits(FAST_TABLEBITS) as usize];
 
     if !FIRST_ENTRY {
-        process_entry(tmp_data.last_state, output_stream);
+        process_entry::<1, false, false>(tmp_data.last_state, output_stream);
     }
 
     if likely(fast_entry.get_flags() == 0) {
-        let offset_bits = fast_entry.get_offset_bits();
+        let offset_bits = fast_entry.get_extra_offset_bits();
         let consumed_bits = fast_entry.get_consumed_bits();
 
-        tmp_data.last_state = DecodeEntryState {
-            entry: fast_entry,
-            offset: fast_entry.get_offset_value() as usize
-                + tmp_data
-                    .input_bitstream
-                    .bits_with_offset(consumed_bits, offset_bits) as usize,
-        };
-
-        let tot_bits = offset_bits + consumed_bits;
-        tmp_data.input_bitstream.remove_bits(tot_bits as usize);
-
-        fast_entry =
-            tables.fast_decode_table[tmp_data.input_bitstream.bits(FAST_TABLEBITS) as usize];
-
-        if !FIRST_ENTRY {
-            process_entry(tmp_data.last_state, output_stream);
-        } else {
-            return Ok(true);
-        }
-
-        if likely(fast_entry.get_flags() == 0) {
-            let offset_bits = fast_entry.get_offset_bits();
-            let consumed_bits = fast_entry.get_consumed_bits();
-
-            tmp_data.last_state = DecodeEntryState {
+        set_next_entry::<_, true>(
+            tmp_data,
+            DecodeEntryState {
                 entry: fast_entry,
                 offset: fast_entry.get_offset_value() as usize
                     + tmp_data
                         .input_bitstream
                         .bits_with_offset(consumed_bits, offset_bits)
                         as usize,
-            };
+            },
+        );
+
+        let tot_bits = offset_bits + consumed_bits;
+        tmp_data.input_bitstream.remove_bits(tot_bits as usize);
+
+        if FIRST_ENTRY {
+            return Ok(true);
+        }
+
+        fast_entry =
+            tables.fast_decode_table[tmp_data.input_bitstream.bits(FAST_TABLEBITS) as usize];
+
+        process_entry::<1, false, false>(tmp_data.last_state, output_stream);
+
+        if likely(fast_entry.get_flags() == 0) {
+            let offset_bits = fast_entry.get_extra_offset_bits();
+            let consumed_bits = fast_entry.get_consumed_bits();
+
+            set_next_entry::<_, true>(
+                tmp_data,
+                DecodeEntryState {
+                    entry: fast_entry,
+                    offset: fast_entry.get_offset_value() as usize
+                        + tmp_data
+                            .input_bitstream
+                            .bits_with_offset(consumed_bits, offset_bits)
+                            as usize,
+                },
+            );
 
             let tot_bits = offset_bits + consumed_bits;
             tmp_data.input_bitstream.remove_bits(tot_bits as usize);
@@ -285,148 +352,205 @@ fn decode_block_instruction<I: DeflateInput, O: DeflateOutput, const FIRST_ENTRY
     #[inline]
     fn cold_path() {}
 
-    match fast_entry.get_flags() {
-        FastDecodeEntry::EXC_LEN_FULLSIZE | FastDecodeEntry::EXC_LEN_EXTRABIT => {
-            tmp_data
-                .input_bitstream
-                .remove_bits(fast_entry.get_consumed_bits() as usize);
-
-            let extra_len = if unlikely(fast_entry.get_flags() == FastDecodeEntry::EXC_LEN_EXTRABIT)
-            {
+    loop {
+        match fast_entry.get_state_flags() {
+            FastDecodeEntry::EXC_LEN_FULLSIZE | FastDecodeEntry::EXC_LEN_EXTRABIT => {
                 tmp_data
                     .input_bitstream
-                    .pop_bits(fast_entry.get_exceptional_length_bits() as usize)
-            } else {
-                0
-            };
+                    .remove_bits(fast_entry.get_consumed_bits() as usize);
 
-            let mut offset_entry = tables.offset_decode_table
-                [tmp_data.input_bitstream.bits(OFFSET_TABLEBITS) as usize];
-
-            if unlikely(offset_entry.is_subtable_pointer()) {
-                tmp_data.input_bitstream.remove_bits(OFFSET_TABLEBITS);
-                offset_entry = tables.offset_decode_subtable[(offset_entry.get_result()
-                    + tmp_data
+                let extra_len = if unlikely(
+                    fast_entry.get_state_flags() == FastDecodeEntry::EXC_LEN_EXTRABIT,
+                ) {
+                    tmp_data
                         .input_bitstream
-                        .bits(offset_entry.get_subtable_length() as usize))
-                    as usize];
+                        .pop_bits(fast_entry.get_exceptional_length_bits() as usize)
+                } else {
+                    0
+                };
+
+                let mut offset_entry = tables.offset_decode_table
+                    [tmp_data.input_bitstream.bits(OFFSET_TABLEBITS) as usize];
+
+                if unlikely(offset_entry.is_subtable_pointer()) {
+                    tmp_data.input_bitstream.remove_bits(OFFSET_TABLEBITS);
+                    offset_entry = tables.offset_decode_subtable[(offset_entry.get_subtable_index()
+                        + tmp_data
+                            .input_bitstream
+                            .bits(offset_entry.get_subtable_length() as usize))
+                        as usize];
+                }
+
+                let offset_consumed = offset_entry.get_consumed_bits();
+                let offset_extrabit = offset_entry.get_extra_offset_bits();
+
+                fast_entry.inc_len_value(extra_len as u16);
+                fast_entry.or_flags(offset_entry.get_copy_flags());
+                set_next_entry::<_, false>(
+                    tmp_data,
+                    DecodeEntryState {
+                        entry: fast_entry,
+                        offset: offset_entry.get_offset_value() as usize
+                            + tmp_data
+                                .input_bitstream
+                                .bits_with_offset(offset_consumed, offset_extrabit)
+                                as usize,
+                    },
+                );
+
+                tmp_data
+                    .input_bitstream
+                    .remove_bits(offset_consumed as usize + offset_extrabit as usize);
             }
+            FastDecodeEntry::EXC_END_OF_BLOCK => {
+                cold_path();
+                tmp_data
+                    .input_bitstream
+                    .remove_bits(fast_entry.get_consumed_bits() as usize);
+                return Ok(false);
+            }
+            FastDecodeEntry::EXC_LEN_SUBTABLE => {
+                cold_path();
 
-            let offset_consumed = offset_entry.get_maintable_length();
-            let offset_extrabit = offset_entry.get_subtable_length();
+                /* Litlen subtable required (uncommon case)  */
+                tmp_data.input_bitstream.remove_bits(LITLEN_TABLEBITS);
 
-            fast_entry.inc_len_value(extra_len as u16);
-            tmp_data.last_state = DecodeEntryState {
-                entry: fast_entry,
-                offset: offset_entry.get_result() as usize
+                // It is a subtable pointer
+                let entry = tables.litlen_decode_subtable[(fast_entry.get_subtable_index()
                     + tmp_data
                         .input_bitstream
-                        .bits_with_offset(offset_consumed, offset_extrabit)
-                        as usize,
-            };
+                        .bits(fast_entry.get_subtable_length() as usize))
+                    as usize];
 
-            tmp_data
-                .input_bitstream
-                .remove_bits(offset_consumed as usize + offset_extrabit as usize);
+                if entry.has_literals() {
+                    /* Literal  */
+                    tmp_data
+                        .input_bitstream
+                        .remove_bits(entry.get_consumed_bits() as usize);
 
+                    set_next_entry::<_, false>(tmp_data, DecodeEntryState { entry, offset: 0 });
+                    return Ok(true);
+                }
+
+                tmp_data
+                    .input_bitstream
+                    .remove_bits(entry.get_consumed_bits() as usize);
+
+                /* end-of-block  */
+                if unlikely(entry.get_state_flags() == FastDecodeEntry::EXC_END_OF_BLOCK) {
+                    return Ok(false);
+                }
+
+                // /* Match  */
+                tmp_data.input_bitstream.force_ensure_bits();
+
+                /* Pop the extra length bits and add them to the length base to
+                 * produce the full length.  */
+                let length = entry.get_len_value()
+                    + tmp_data
+                        .input_bitstream
+                        .pop_bits(entry.get_exceptional_length_bits() as usize)
+                        as u16;
+
+                /* Decode the match offset.  */
+                let mut offset_entry = tables.offset_decode_table
+                    [tmp_data.input_bitstream.bits(OFFSET_TABLEBITS) as usize];
+                if unlikely(offset_entry.is_subtable_pointer()) {
+                    /* Offset subtable required (uncommon case)  */
+                    tmp_data.input_bitstream.remove_bits(OFFSET_TABLEBITS);
+                    offset_entry = tables.offset_decode_subtable[(offset_entry.get_subtable_index()
+                        + tmp_data
+                            .input_bitstream
+                            .bits(offset_entry.get_subtable_length() as usize))
+                        as usize];
+                }
+                tmp_data
+                    .input_bitstream
+                    .remove_bits(offset_entry.get_consumed_bits() as usize);
+
+                const_assert!(
+                    can_ensure(DEFLATE_MAX_EXTRA_LENGTH_BITS + DEFLATE_MAX_OFFSET_CODEWORD_LEN)
+                        && can_ensure(DEFLATE_MAX_EXTRA_OFFSET_BITS)
+                );
+
+                /* Pop the extra offset bits and add them to the offset base to
+                 * produce the full offset.  */
+                let offset = offset_entry.get_offset_value() as usize
+                    + tmp_data
+                        .input_bitstream
+                        .pop_bits(offset_entry.get_extra_offset_bits() as usize)
+                        as usize;
+
+                set_next_entry::<_, false>(
+                    tmp_data,
+                    DecodeEntryState {
+                        entry: FastDecodeEntry::new_from_len_with_flags(
+                            length as u16,
+                            entry.get_copy_flags() | offset_entry.get_copy_flags(),
+                        ),
+                        offset,
+                    },
+                );
+            }
+            _ => {
+                let offset_bits = fast_entry.get_extra_offset_bits();
+                let consumed_bits = fast_entry.get_consumed_bits();
+
+                set_next_entry::<_, false>(
+                    tmp_data,
+                    DecodeEntryState {
+                        entry: fast_entry,
+                        offset: fast_entry.get_offset_value() as usize
+                            + tmp_data
+                                .input_bitstream
+                                .bits_with_offset(consumed_bits, offset_bits)
+                                as usize,
+                    },
+                );
+
+                let tot_bits = offset_bits + consumed_bits;
+                tmp_data.input_bitstream.remove_bits(tot_bits as usize);
+            }
+        }
+
+        match tmp_data.last_state.entry.get_copy_flags() {
+            FastDecodeEntry::EXC_SMALLOFFSET => {
+                process_entry::<0, true, false>(tmp_data.last_state, output_stream);
+            }
+            FastDecodeEntry::EXC_BIGLEN32 => {
+                process_entry::<2, false, false>(tmp_data.last_state, output_stream);
+            }
+            FastDecodeEntry::EXC_BIGLEN => {
+                process_entry::<0, false, true>(tmp_data.last_state, output_stream);
+            }
+            _ => return Ok(true),
+        }
+
+        tmp_data.input_bitstream.force_ensure_bits_refill();
+        fast_entry =
+            tables.fast_decode_table[tmp_data.input_bitstream.bits(FAST_TABLEBITS) as usize];
+
+        if likely(fast_entry.get_flags() == 0) {
+            let offset_bits = fast_entry.get_extra_offset_bits();
+            let consumed_bits = fast_entry.get_consumed_bits();
+
+            set_next_entry::<_, true>(
+                tmp_data,
+                DecodeEntryState {
+                    entry: fast_entry,
+                    offset: fast_entry.get_offset_value() as usize
+                        + tmp_data
+                            .input_bitstream
+                            .bits_with_offset(consumed_bits, offset_bits)
+                            as usize,
+                },
+            );
+
+            let tot_bits = offset_bits + consumed_bits;
+            tmp_data.input_bitstream.remove_bits(tot_bits as usize);
             return Ok(true);
         }
-        FastDecodeEntry::EXC_END_OF_BLOCK => {
-            cold_path();
-            tmp_data
-                .input_bitstream
-                .remove_bits(fast_entry.get_consumed_bits() as usize);
-            return Ok(false);
-        }
-        _ => {
-            cold_path();
-        }
     }
-
-    /* Litlen subtable required (uncommon case)  */
-    tmp_data.input_bitstream.remove_bits(LITLEN_TABLEBITS);
-
-    // Surely a subtable pointer
-    let entry = tables.litlen_decode_subtable[(fast_entry.get_subtable_index()
-        + tmp_data
-            .input_bitstream
-            .bits(fast_entry.get_subtable_length() as usize))
-        as usize];
-
-    if entry.is_literal() {
-        /* Literal  */
-        tmp_data
-            .input_bitstream
-            .remove_bits(entry.get_maintable_length() as usize);
-
-        tmp_data.last_state = DecodeEntryState {
-            entry: FastDecodeEntry::new_from_literal(entry.get_literal()),
-            offset: 0,
-        };
-
-        // literal_cb(context, entry.get_literal())?;
-        tmp_data
-            .input_bitstream
-            .ensure_bits::<false>(DEFLATE_MAX_LITLEN_CODEWORD_LEN);
-        return Ok(true);
-    }
-
-    /* end-of-block  */
-    if unlikely(entry.is_end_of_block()) {
-        tmp_data
-            .input_bitstream
-            .remove_bits(entry.get_maintable_length() as usize);
-        return Ok(false);
-    }
-
-    tmp_data
-        .input_bitstream
-        .remove_bits(entry.get_maintable_length() as usize);
-
-    // /* Match  */
-    tmp_data.input_bitstream.force_ensure_bits();
-
-    /* Pop the extra length bits and add them to the length base to
-     * produce the full length.  */
-    let length = entry.get_result()
-        + tmp_data
-            .input_bitstream
-            .pop_bits(entry.get_subtable_length() as usize);
-
-    /* Decode the match offset.  */
-    let mut offset_entry =
-        tables.offset_decode_table[tmp_data.input_bitstream.bits(OFFSET_TABLEBITS) as usize];
-    if unlikely(offset_entry.is_subtable_pointer()) {
-        /* Offset subtable required (uncommon case)  */
-        tmp_data.input_bitstream.remove_bits(OFFSET_TABLEBITS);
-        offset_entry = tables.offset_decode_subtable[(offset_entry.get_result()
-            + tmp_data
-                .input_bitstream
-                .bits(offset_entry.get_subtable_length() as usize))
-            as usize];
-    }
-    tmp_data
-        .input_bitstream
-        .remove_bits(offset_entry.get_maintable_length() as usize);
-
-    const_assert!(
-        can_ensure(DEFLATE_MAX_EXTRA_LENGTH_BITS + DEFLATE_MAX_OFFSET_CODEWORD_LEN)
-            && can_ensure(DEFLATE_MAX_EXTRA_OFFSET_BITS)
-    );
-
-    /* Pop the extra offset bits and add them to the offset base to
-     * produce the full offset.  */
-    let offset = offset_entry.get_result()
-        + tmp_data
-            .input_bitstream
-            .pop_bits(offset_entry.get_subtable_length() as usize);
-
-    tmp_data.last_state = DecodeEntryState {
-        entry: FastDecodeEntry::new_from_len(length as u16),
-        offset: offset as usize,
-    };
-
-    Ok(true)
 }
 
 // #[inline(never)]
@@ -468,16 +592,7 @@ fn decode_block_instruction<I: DeflateInput, O: DeflateOutput, const FIRST_ENTRY
 // }
 
 #[inline(never)]
-pub fn libdeflate_deflate_decompress<I: DeflateInput, O: DeflateOutput>(
-    d: &mut LibdeflateDecodeTables,
-    in_stream: &mut I,
-    out_stream: &mut O,
-) -> Result<(), LibdeflateError> {
-    deflate_decompress_template(d, in_stream, out_stream)
-}
-
-#[inline(always)]
-pub(crate) fn deflate_decompress_template<I: DeflateInput, O: DeflateOutput>(
+pub(crate) fn libdeflate_deflate_decompress<I: DeflateInput, O: DeflateOutput>(
     tables: &mut LibdeflateDecodeTables,
     in_stream: &mut I,
     out_stream: &mut O,

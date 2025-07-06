@@ -20,7 +20,6 @@
  * macros.
  */
 
-pub mod decode_entry;
 pub mod fast_decode_entry;
 
 use crate::bitstream::BitStream;
@@ -36,11 +35,10 @@ use crate::decompress_deflate::{
     LITLEN_TABLESIZE, OFFSET_SUBTABLESIZE, OFFSET_TABLEBITS, OFFSET_TABLESIZE,
     PRECODE_SUBTABLESIZE, PRECODE_TABLEBITS, PRECODE_TABLESIZE,
 };
-use crate::decompress_utils::decode_entry::DecodeEntry;
 use crate::decompress_utils::fast_decode_entry::FastDecodeEntry;
 use crate::deflate_constants::*;
 use crate::unchecked::{UncheckedArray, UncheckedSlice};
-use crate::{DeflateInput, DeflateOutput, LibdeflateDecodeTables, LibdeflateError};
+use crate::{DeflateInput, LibdeflateDecodeTables};
 use nightly_quirks::branch_pred::unlikely;
 
 #[derive(Default, Copy, Clone)]
@@ -56,6 +54,11 @@ pub struct DecompressTempData<'a, I: DeflateInput> {
     pub last_state: DecodeEntryState,
 }
 
+#[inline(always)]
+pub unsafe fn copy_word_unaligned(src: *const u64, dst: *mut u64) {
+    dst.write_unaligned(src.read_unaligned())
+}
+
 /*****************************************************************************
  *                              Huffman decoding                             *
  *****************************************************************************/
@@ -69,11 +72,11 @@ pub struct DecompressTempData<'a, I: DeflateInput> {
 /* The decode result for each precode symbol.  There is no special optimization
  * for the precode; the decode result is simply the symbol value.  */
 #[inline(always)]
-const fn hr_entry(presym: u32) -> DecodeEntry {
-    DecodeEntry::new_result(presym)
+const fn hr_entry(presym: u8) -> FastDecodeEntry {
+    FastDecodeEntry::new_presym(presym)
 }
 
-const PRECODE_DECODE_RESULTS: UncheckedArray<DecodeEntry, DEFLATE_NUM_PRECODE_SYMS> =
+const PRECODE_DECODE_RESULTS: UncheckedArray<FastDecodeEntry, DEFLATE_NUM_PRECODE_SYMS> =
     UncheckedArray([
         hr_entry(0),
         hr_entry(1),
@@ -101,16 +104,16 @@ const PRECODE_DECODE_RESULTS: UncheckedArray<DecodeEntry, DEFLATE_NUM_PRECODE_SY
  * base and the number of extra length bits.  */
 
 #[inline(always)]
-const fn ld1_entry(literal: u8) -> DecodeEntry {
-    DecodeEntry::new_literal(literal)
+const fn ld1_entry(literal: u8) -> FastDecodeEntry {
+    FastDecodeEntry::new_from_literal(literal)
 }
 
 #[inline(always)]
-const fn ld2_entry(length_base: u32, num_extra_bits: u8) -> DecodeEntry {
-    DecodeEntry::new_length(length_base, num_extra_bits)
+const fn ld2_entry(length_base: u16, num_extra_bits: u8) -> FastDecodeEntry {
+    FastDecodeEntry::new_from_len_and_extra_bits(length_base, num_extra_bits)
 }
 
-const LITLEN_DECODE_RESULTS: UncheckedArray<DecodeEntry, DEFLATE_NUM_LITLEN_SYMS> =
+const LITLEN_DECODE_RESULTS: UncheckedArray<FastDecodeEntry, DEFLATE_NUM_LITLEN_SYMS> =
     UncheckedArray([
         /* Literals  */
         ld1_entry(0),
@@ -370,7 +373,7 @@ const LITLEN_DECODE_RESULTS: UncheckedArray<DecodeEntry, DEFLATE_NUM_LITLEN_SYMS
         ld1_entry(254),
         ld1_entry(255),
         /* End of block  */
-        DecodeEntry::end_of_block(),
+        FastDecodeEntry::new_end_of_block(),
         /* Lengths  */
         ld2_entry(3, 0),
         ld2_entry(4, 0),
@@ -409,11 +412,11 @@ const LITLEN_DECODE_RESULTS: UncheckedArray<DecodeEntry, DEFLATE_NUM_LITLEN_SYMS
  * number of extra offset bits.  */
 
 #[inline(always)]
-const fn odr_entry(offset_base: u32, num_extra_bits: u8) -> DecodeEntry {
-    DecodeEntry::new_offset(offset_base, num_extra_bits)
+const fn odr_entry(offset_base: u16, num_extra_bits: u8) -> FastDecodeEntry {
+    FastDecodeEntry::new_from_offset_and_extra_bits(offset_base, num_extra_bits)
 }
 
-const OFFSET_DECODE_RESULTS: UncheckedArray<DecodeEntry, DEFLATE_NUM_OFFSET_SYMS> =
+const OFFSET_DECODE_RESULTS: UncheckedArray<FastDecodeEntry, DEFLATE_NUM_OFFSET_SYMS> =
     UncheckedArray([
         odr_entry(1, 0),
         odr_entry(2, 0),
@@ -452,7 +455,7 @@ const OFFSET_DECODE_RESULTS: UncheckedArray<DecodeEntry, DEFLATE_NUM_OFFSET_SYMS
 const fn advance_codeword(codeword: usize, mask: usize) -> usize {
     #[inline(always)]
     const fn bsr32(val: u32) -> u32 {
-        (std::mem::size_of::<u32>() * 8) as u32 - 1 - val.leading_zeros()
+        ((std::mem::size_of::<u32>() * 8) as u32 - 1).wrapping_sub(val.leading_zeros())
     }
 
     /*
@@ -471,14 +474,14 @@ const fn advance_codeword(codeword: usize, mask: usize) -> usize {
      * it with (1U << len) - 1 == cur_table_end - 1.
      */
 
-    let bit = 1 << bsr32((codeword ^ mask) as u32);
+    let bit = 1usize.wrapping_shl(bsr32((codeword ^ mask) as u32));
     (codeword & (bit - 1)) | bit
 }
 
 #[derive(Clone, Copy)]
 pub struct TempFastDecodeBuild {
     codeword: usize,
-    new_entry: DecodeEntry,
+    new_entry: FastDecodeEntry,
 }
 
 /*
@@ -489,8 +492,8 @@ pub struct TempFastDecodeBuild {
  * After that the offset is also decoded using the slow way (possibly with subtables)
 */
 pub fn build_fast_decode_table(
-    litlen_decode_table: &UncheckedArray<DecodeEntry, LITLEN_TABLESIZE>,
-    offset_decode_table: &UncheckedArray<DecodeEntry, OFFSET_TABLESIZE>,
+    litlen_decode_table: &UncheckedArray<FastDecodeEntry, LITLEN_TABLESIZE>,
+    offset_decode_table: &UncheckedArray<FastDecodeEntry, OFFSET_TABLESIZE>,
     fast_table: &mut UncheckedArray<FastDecodeEntry, FAST_TABLESIZE>,
     temp_indices_litlen: &mut Vec<TempFastDecodeBuild>,
 ) {
@@ -510,16 +513,17 @@ pub fn build_fast_decode_table(
         let used_bits = fast_entry.get_consumed_bits() as usize;
         let shifted_codeword = codeword >> used_bits;
 
-        if !litlen.is_exceptional() {
-            if litlen.is_literal() {
+        if !litlen.is_subtable_pointer() {
+            if litlen.has_literals() {
                 temp_indices_litlen.push(TempFastDecodeBuild {
                     codeword,
                     new_entry: litlen_decode_table[shifted_codeword],
                 });
             } else if fast_entry.get_flags() == FastDecodeEntry::EXC_LEN_FULLSIZE {
-                let offset_entry = offset_decode_table[shifted_codeword];
-                let offset_bits = offset_entry.get_maintable_length() as usize;
-                if used_bits + offset_bits <= FAST_TABLEBITS && !offset_entry.is_exceptional() {
+                let offset_entry = offset_decode_table[shifted_codeword % OFFSET_TABLESIZE];
+                let offset_bits = offset_entry.get_consumed_bits() as usize;
+                if used_bits + offset_bits <= FAST_TABLEBITS && !offset_entry.is_subtable_pointer()
+                {
                     fast_entry.add_offset_entry(offset_entry);
                 }
             }
@@ -530,17 +534,16 @@ pub fn build_fast_decode_table(
     while temp_indices_litlen.len() > 0 {
         // Filter temp indices
         temp_indices_litlen.retain_mut(|index| {
-            // println!("Index: {} entry: {:?}", index.codeword, index.new_entry);
             let fast_entry = &mut fast_table[index.codeword];
 
-            let litlen_bits = index.new_entry.get_maintable_length() as usize
-                + index.new_entry.get_subtable_length() as usize;
+            let litlen_bits = index.new_entry.get_consumed_bits() as usize
+                + index.new_entry.get_exceptional_length_bits() as usize;
             let used_bits = fast_entry.get_consumed_bits() as usize;
 
             if used_bits + litlen_bits <= FAST_TABLEBITS {
                 let shifted_codeword = index.codeword >> used_bits;
 
-                if index.new_entry.is_literal() {
+                if index.new_entry.has_literals() {
                     // Add a new literal entry
                     if !fast_entry.maybe_add_litlen_entry(index.new_entry, shifted_codeword) {
                         // No more entries can be added, exit
@@ -552,18 +555,17 @@ pub fn build_fast_decode_table(
                             litlen_decode_table[shifted_codeword % (1 << OFFSET_TABLEBITS)];
                         return true;
                     }
-                } else {
+                } else if index.new_entry.get_flags() == FastDecodeEntry::EXC_LEN_EXTRABIT {
                     // We had a length entry, try to match the offset
                     let shifted_codeword = index.codeword >> (used_bits + litlen_bits);
-                    let offset_entry = offset_decode_table[shifted_codeword];
-                    let offset_bits = offset_entry.get_maintable_length() as usize;
+                    let offset_entry = offset_decode_table[shifted_codeword % OFFSET_TABLESIZE];
+                    let offset_bits = offset_entry.get_consumed_bits() as usize;
 
                     if used_bits + litlen_bits + offset_bits <= FAST_TABLEBITS
-                        && !offset_entry.is_exceptional()
+                        && !offset_entry.is_subtable_pointer()
                     {
                         // Only if we can match a full length + offset add it to the entry
                         if !fast_entry.maybe_add_litlen_entry(index.new_entry, shifted_codeword) {
-                            // The litlen entry could not be added
                             return false;
                         }
                         fast_entry.add_offset_entry(offset_entry);
@@ -573,33 +575,6 @@ pub fn build_fast_decode_table(
             false
         });
     }
-
-    // // let mut exc_count = 0;
-    // for codeword in 0..(1 << FAST_TABLEBITS) {
-    //     if fast_table[codeword].get_len_value() != 0 && fast_table[codeword].get_flags() == 0 {
-    //         assert!(fast_table[codeword].get_offset_value() > 0);
-    //     }
-    //     if fast_table[codeword].get_flags() == 0 {
-    //         assert!(fast_table[codeword].get_literals_count() <= 2);
-    //     }
-
-    //     // exc_count += (fast_table[codeword].get_flags() != 0) as usize;
-    // }
-
-    // println!("Exceptional: {} / {}", exc_count, 1 << FAST_TABLEBITS);
-
-    // todo!();
-
-    // let mut tot_bits = 0;
-    // for fast in fast_table.0 {
-    //     tot_bits += fast.get_used_bits();
-    // }
-    // println!(
-    //     "Fast: {} / {} avg bitlen: {:.3}",
-    //     fast_entries,
-    //     1 << FAST_TABLEBITS,
-    //     tot_bits as f64 / (1 << FAST_TABLEBITS) as f64
-    // );
 }
 
 /*
@@ -620,11 +595,11 @@ pub fn build_decode_table<
     const DECODE_RESULTS_SIZE: usize,
     const BUILD_SYM_MAP: bool,
 >(
-    decode_table: &mut UncheckedArray<DecodeEntry, DECODE_TABLE_SIZE>,
-    decode_subtable: &mut UncheckedArray<DecodeEntry, DECODE_SUBTABLE_SIZE>,
+    decode_table: &mut UncheckedArray<FastDecodeEntry, DECODE_TABLE_SIZE>,
+    decode_subtable: &mut UncheckedArray<FastDecodeEntry, DECODE_SUBTABLE_SIZE>,
     lens: &UncheckedSlice<LenType>,
     num_syms: usize,
-    decode_results: &UncheckedArray<DecodeEntry, DECODE_RESULTS_SIZE>,
+    decode_results: &UncheckedArray<FastDecodeEntry, DECODE_RESULTS_SIZE>,
     table_bits: usize,
     max_codeword_len: usize,
     sorted_syms: &mut UncheckedArray<u16, DEFLATE_MAX_NUM_SYMS>,
@@ -774,7 +749,7 @@ pub fn build_decode_table<
         for _ in 0..len_counts[len] {
             /* Fill the first entry for the current codeword. */
             decode_table[codeword] =
-                decode_results[sorted_syms[sym_index] as usize].make_decode_table_entry(len as u32);
+                decode_results[sorted_syms[sym_index] as usize].make_decode_table_entry(len as u8);
             sym_index += 1;
 
             codeword = advance_codeword(codeword, cur_table_end - 1);
@@ -836,16 +811,15 @@ pub fn build_decode_table<
                  * number of entries it contains).
                  */
 
-                decode_table[subtable_prefix] = DecodeEntry::new_subtable_pointer(
-                    subtable_start as u32,
+                decode_table[subtable_prefix] = FastDecodeEntry::new_subtable_pointer(
+                    subtable_start as u16,
                     subtable_bits as u8,
-                    table_bits as u8,
                 );
             }
 
             /* Fill the subtable entries for the current codeword. */
             let entry = decode_results[sorted_syms[sym_index] as usize]
-                .make_decode_table_entry((len - table_bits) as u32);
+                .make_decode_table_entry((len - table_bits) as u8);
             sym_index += 1;
 
             let mut i = subtable_start + (codeword >> table_bits);

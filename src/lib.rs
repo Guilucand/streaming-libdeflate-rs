@@ -1,9 +1,5 @@
 // #![cfg_attr(debug_assertions, deny(warnings))]
-pub mod bitstream_new;
-pub mod bitstream_old;
-
-pub use bitstream_new as bitstream;
-// pub use bitstream_old as bitstream;
+pub mod bitstream;
 
 pub(crate) mod block_finder;
 pub mod decode_blocks;
@@ -14,7 +10,6 @@ mod deflate_constants;
 mod gzip_constants;
 pub mod streams;
 pub mod unchecked;
-mod utils;
 
 #[macro_use]
 extern crate static_assertions;
@@ -24,7 +19,6 @@ use crate::decompress_deflate::{
     OFFSET_SUBTABLESIZE, OFFSET_TABLESIZE,
 };
 use crate::decompress_gzip::libdeflate_gzip_decompress;
-use crate::decompress_utils::decode_entry::DecodeEntry;
 use crate::decompress_utils::fast_decode_entry::FastDecodeEntry;
 use crate::deflate_constants::DEFLATE_MAX_NUM_SYMS;
 use crate::streams::deflate_chunked_buffer_input::DeflateChunkedBufferInput;
@@ -43,14 +37,14 @@ use std::path::Path;
  */
 pub struct LibdeflateDecodeTables {
     pub(crate) huffman_decode: HuffmanDecodeStruct,
-    pub(crate) litlen_decode_table: UncheckedArray<DecodeEntry, LITLEN_TABLESIZE>,
+    pub(crate) litlen_decode_table: UncheckedArray<FastDecodeEntry, LITLEN_TABLESIZE>,
 
-    pub(crate) offset_decode_table: UncheckedArray<DecodeEntry, OFFSET_TABLESIZE>,
+    pub(crate) offset_decode_table: UncheckedArray<FastDecodeEntry, OFFSET_TABLESIZE>,
 
     pub(crate) fast_decode_table: UncheckedArray<FastDecodeEntry, FAST_TABLESIZE>,
 
-    pub(crate) litlen_decode_subtable: UncheckedArray<DecodeEntry, LITLEN_SUBTABLESIZE>,
-    pub(crate) offset_decode_subtable: UncheckedArray<DecodeEntry, OFFSET_SUBTABLESIZE>,
+    pub(crate) litlen_decode_subtable: UncheckedArray<FastDecodeEntry, LITLEN_SUBTABLESIZE>,
+    pub(crate) offset_decode_subtable: UncheckedArray<FastDecodeEntry, OFFSET_SUBTABLESIZE>,
 
     /* used only during build_decode_table() */
     pub(crate) sorted_syms: UncheckedArray<u16, DEFLATE_MAX_NUM_SYMS>,

@@ -1,4 +1,4 @@
-use crate::{DeflateInput, DeflateOutput};
+use crate::{decompress_utils::copy_word_unaligned, DeflateInput, DeflateOutput};
 use nightly_quirks::utils::NightlyUtils;
 use std::cmp::min;
 
@@ -86,7 +86,7 @@ impl<'a> DeflateInput for DeflateChunkedBufferInput<'a> {
     #[inline(always)]
     fn read<const REFILL: bool>(&mut self, out_data: &mut [u8]) -> usize {
         const REFILL: bool = true;
-        if REFILL && self.end_position + out_data.len() > self.position {
+        if REFILL && self.end_position < self.position + out_data.len() {
             self.refill_buffer();
         }
 
@@ -127,18 +127,42 @@ impl<'a> DeflateInput for DeflateChunkedBufferInput<'a> {
 
     #[inline(always)]
     fn read_exact_into<O: DeflateOutput>(&mut self, out_stream: &mut O, mut length: usize) -> bool {
-        todo!();
-        // while length > 0 {
-        //     let buffer = out_stream.get_available_buffer();
-        //     let copyable = min(buffer.len(), length);
-        //     if self.read::<true>(&mut buffer[0..copyable]) != copyable {
-        //         return false;
-        //     }
-        //     unsafe {
-        //         out_stream.advance_available_buffer_position(copyable);
-        //     }
-        //     length -= copyable;
-        // }
+        const CHUNK_SIZE: usize = 256;
+        unsafe {
+            while length > 0 {
+                out_stream.flush_ensure_length(CHUNK_SIZE);
+                self.ensure_overread_length();
+
+                let mut src = self.buffer.as_ptr().add(self.position) as *const u64;
+                let mut dst = out_stream.get_output_ptr() as *mut u64;
+
+                let max_copyable = length
+                    .min(CHUNK_SIZE)
+                    .min(self.end_position - self.position);
+                let mut copyable = max_copyable as isize;
+                while copyable > 0 {
+                    copy_word_unaligned(src, dst);
+                    copy_word_unaligned(src.add(1), dst.add(1));
+                    src = src.add(2);
+                    dst = dst.add(2);
+                    copyable -= 16;
+                }
+                length -= max_copyable - copyable.max(0) as usize;
+
+                let mut src = src as *mut u8;
+                let mut dst = dst as *mut u8;
+                if copyable < 0 {
+                    // Remove extra copied bytes
+                    src = src.sub(-copyable as usize);
+                    dst = dst.sub(-copyable as usize);
+                }
+
+                out_stream.set_output_ptr(dst);
+
+                self.position = src.offset_from(self.buffer.as_ptr()) as usize;
+            }
+        }
+
         true
     }
 }

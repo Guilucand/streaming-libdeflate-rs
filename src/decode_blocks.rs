@@ -1,5 +1,4 @@
 use crate::{
-    bitstream::can_ensure,
     decompress_deflate::{LenType, PRECODE_TABLEBITS},
     decompress_utils::{
         build_fast_decode_table, build_litlen_decode_table, build_offset_decode_table,
@@ -15,10 +14,7 @@ use crate::{
 
 #[inline(always)]
 pub fn decode_huffman_header_flags<I: DeflateInput>(tmp_data: &mut DecompressTempData<I>) {
-    const_assert!(can_ensure(1 + 2 + 5 + 5 + 4));
-    tmp_data
-        .input_bitstream
-        .ensure_bits::<true>(1 + 2 + 5 + 5 + 4);
+    tmp_data.input_bitstream.force_ensure_bits_refill();
 
     /* BFINAL: 1 bit  */
     tmp_data.is_final_block = tmp_data.input_bitstream.pop_bits(1) != 0;
@@ -91,14 +87,17 @@ pub fn decode_dynamic_huffman_block<I: DeflateInput>(
     /* Read the precode codeword lengths.  */
     const_assert!(DEFLATE_MAX_PRE_CODEWORD_LEN == (1 << 3) - 1);
 
-    for i in 0..num_explicit_precode_lens {
-        const_assert!(can_ensure(3));
-        tmp_data.input_bitstream.ensure_bits::<true>(3);
+    tmp_data.input_bitstream.force_ensure_bits_refill();
+    for i in 0..4 {
         tables.huffman_decode.precode_lens[DEFLATE_PRECODE_LENS_PERMUTATION[i] as usize] =
             tmp_data.input_bitstream.pop_bits(3) as u8;
     }
 
-    // println!("Precode lens: {:?}", d.precode_lens);
+    tmp_data.input_bitstream.force_ensure_bits_refill();
+    for i in 4..num_explicit_precode_lens {
+        tables.huffman_decode.precode_lens[DEFLATE_PRECODE_LENS_PERMUTATION[i] as usize] =
+            tmp_data.input_bitstream.pop_bits(3) as u8;
+    }
 
     for i in num_explicit_precode_lens..DEFLATE_NUM_PRECODE_SYMS {
         tables.huffman_decode.precode_lens[DEFLATE_PRECODE_LENS_PERMUTATION[i] as usize] = 0;
@@ -108,12 +107,15 @@ pub fn decode_dynamic_huffman_block<I: DeflateInput>(
     safety_check!(build_precode_decode_table(tables));
 
     /* Expand the literal/length and offset codeword lengths.  */
-    let mut i = 0;
-    while i < num_litlen_syms + num_offset_syms {
-        tmp_data
-            .input_bitstream
-            .ensure_bits::<true>(DEFLATE_MAX_PRE_CODEWORD_LEN + 7);
 
+    let mut i = 0;
+    let mut it_count = 0;
+    while i < num_litlen_syms + num_offset_syms {
+        if it_count % 4 == 0 {
+            // 14 * 4 = 56 bits max
+            tmp_data.input_bitstream.force_ensure_bits_refill();
+        }
+        it_count += 1;
         /* (The code below assumes that the precode decode table
          * does not have any subtables.)  */
         const_assert!(PRECODE_TABLEBITS == DEFLATE_MAX_PRE_CODEWORD_LEN);
@@ -123,8 +125,8 @@ pub fn decode_dynamic_huffman_block<I: DeflateInput>(
             [tmp_data.input_bitstream.bits(DEFLATE_MAX_PRE_CODEWORD_LEN) as usize];
         tmp_data
             .input_bitstream
-            .remove_bits(entry.get_maintable_length() as usize);
-        let presym = entry.get_result();
+            .remove_bits(entry.get_consumed_bits() as usize);
+        let presym = entry.get_presym();
 
         if presym < 16 {
             /* Explicit codeword length  */
@@ -225,9 +227,10 @@ pub fn decode_uncompressed_block<I: DeflateInput, O: DeflateOutput>(
 
     safety_check!(len == !nlen);
 
-    // uncompressed_cb(context, &mut tmp_data.input_bitstream, len as usize)?;
+    tmp_data
+        .input_bitstream
+        .read_exact_into(out_stream, len as usize);
 
-    todo!();
     Ok(())
 }
 

@@ -139,6 +139,14 @@ impl<'a, I: DeflateInput> BitStream<'a, I> {
     }
 
     #[inline(always)]
+    pub fn force_ensure_bits_refill(&mut self) {
+        self.input_stream.ensure_overread_length();
+        unsafe {
+            self.fill_bits_wordwise();
+        }
+    }
+
+    #[inline(always)]
     pub fn force_ensure_bits(&mut self) {
         unsafe {
             self.fill_bits_wordwise();

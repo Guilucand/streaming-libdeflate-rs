@@ -1,3 +1,4 @@
+#![allow(warnings)]
 use crate::deflate_constants::{DEFLATE_MAX_PRE_CODEWORD_LEN, DEFLATE_NUM_PRECODE_SYMS};
 
 #[derive(Clone)]
