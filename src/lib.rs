@@ -1,5 +1,10 @@
 // #![cfg_attr(debug_assertions, deny(warnings))]
-pub mod bitstream;
+pub mod bitstream_new;
+pub mod bitstream_old;
+
+pub use bitstream_new as bitstream;
+// pub use bitstream_old as bitstream;
+
 pub(crate) mod block_finder;
 pub mod decode_blocks;
 pub mod decompress_deflate;
@@ -18,15 +23,19 @@ extern crate static_assertions;
 extern crate mt_debug_counters;
 
 use crate::decompress_deflate::{
-    LenType, OutStreamResult, _DecStruct, LITLEN_ENOUGH, OFFSET_ENOUGH,
+    HuffmanDecodeStruct, OutStreamResult, FAST_TABLESIZE, LITLEN_SUBTABLESIZE, LITLEN_TABLESIZE,
+    OFFSET_SUBTABLESIZE, OFFSET_TABLESIZE,
 };
 use crate::decompress_gzip::libdeflate_gzip_decompress;
-use crate::decompress_utils::DecodeEntry;
-use crate::deflate_constants::{DEFLATE_MAX_NUM_SYMS, DEFLATE_NUM_PRECODE_SYMS};
+use crate::decompress_utils::decode_entry::DecodeEntry;
+use crate::decompress_utils::fast_decode_entry::FastDecodeEntry;
+use crate::deflate_constants::DEFLATE_MAX_NUM_SYMS;
+use crate::streams::deflate_chunked_buffer_input::DeflateChunkedBufferInput;
 use crate::streams::deflate_chunked_buffer_output::DeflateChunkedBufferOutput;
-use crate::streams::deflate_filebuffer_input::DeflateFileBufferInput;
 use crate::unchecked::UncheckedArray;
-use std::mem::{size_of, MaybeUninit};
+use std::fs::File;
+use std::io::Read;
+use std::mem::size_of;
 use std::path::Path;
 
 /*
@@ -35,12 +44,16 @@ use std::path::Path;
  * decompression state, but rather only some arrays that are too large to
  * comfortably allocate on the stack.
  */
-pub struct LibdeflateDecompressor {
-    pub(crate) precode_lens: UncheckedArray<LenType, DEFLATE_NUM_PRECODE_SYMS>,
-    pub(crate) l: _DecStruct,
-    pub(crate) litlen_decode_table: UncheckedArray<DecodeEntry, LITLEN_ENOUGH>,
+pub struct LibdeflateDecodeTables {
+    pub(crate) huffman_decode: HuffmanDecodeStruct,
+    pub(crate) litlen_decode_table: UncheckedArray<DecodeEntry, LITLEN_TABLESIZE>,
 
-    pub(crate) offset_decode_table: UncheckedArray<DecodeEntry, OFFSET_ENOUGH>,
+    pub(crate) offset_decode_table: UncheckedArray<DecodeEntry, OFFSET_TABLESIZE>,
+
+    pub(crate) fast_decode_table: UncheckedArray<FastDecodeEntry, FAST_TABLESIZE>,
+
+    pub(crate) litlen_decode_subtable: UncheckedArray<DecodeEntry, LITLEN_SUBTABLESIZE>,
+    pub(crate) offset_decode_subtable: UncheckedArray<DecodeEntry, OFFSET_SUBTABLESIZE>,
 
     /* used only during build_decode_table() */
     pub(crate) sorted_syms: UncheckedArray<u16, DEFLATE_MAX_NUM_SYMS>,
@@ -67,34 +80,38 @@ pub enum LibdeflateError {
 }
 
 pub trait DeflateInput {
-    const MAX_LOOK_BACK: usize = size_of::<usize>();
+    const MAX_LOOK_BACK: usize = size_of::<usize>() * 2;
+    const MAX_OVERREAD: usize = size_of::<usize>() * 2;
 
     unsafe fn get_le_word_no_advance(&mut self) -> usize;
-    fn move_stream_pos(&mut self, amount: isize) -> bool;
+    fn move_stream_pos<const REFILL: bool>(&mut self, amount: isize);
     fn tell_stream_pos(&self) -> usize;
-    fn read(&mut self, out_data: &mut [u8]) -> usize;
-    fn ensure_length(&mut self, len: usize) -> bool;
-    unsafe fn read_unchecked(&mut self, out_data: &mut [u8]);
+    fn read<const REFILL: bool>(&mut self, out_data: &mut [u8]) -> usize;
+    // Ensure that the current buffer has at least `Self::MAX_OVERREAD` elements. this function must never fail
+    fn ensure_overread_length(&mut self);
+    // Check if the stream buffer has at least Self::MAX_OVERREAD bytes remaining with either valid data or eof data
+    fn has_readable_overread(&self) -> bool;
+    fn has_valid_bytes_slow(&mut self) -> bool;
     fn read_exact_into<O: DeflateOutput>(&mut self, out_stream: &mut O, length: usize) -> bool;
 
     #[inline(always)]
-    fn read_byte(&mut self) -> u8 {
+    fn read_byte<const REFILL: bool>(&mut self) -> u8 {
         let mut byte = [0];
-        self.read(&mut byte);
+        self.read::<REFILL>(&mut byte);
         byte[0]
     }
 
     #[inline(always)]
-    fn read_le_u16(&mut self) -> u16 {
+    fn read_le_u16<const REFILL: bool>(&mut self) -> u16 {
         let mut bytes = [0, 0];
-        self.read(&mut bytes);
+        self.read::<REFILL>(&mut bytes);
         u16::from_le_bytes(bytes)
     }
 
     #[inline(always)]
-    fn read_le_u32(&mut self) -> u32 {
+    fn read_le_u32<const REFILL: bool>(&mut self) -> u32 {
         let mut bytes = [0, 0, 0, 0];
-        self.read(&mut bytes);
+        self.read::<REFILL>(&mut bytes);
         u32::from_le_bytes(bytes)
     }
 }
@@ -109,23 +126,24 @@ pub trait DeflateOutput {
     fn final_flush(&mut self) -> Result<OutStreamResult, ()>;
 }
 
-pub fn libdeflate_alloc_decompressor() -> LibdeflateDecompressor {
-    /*
-     * Note that only certain parts of the decompressor actually must be
-     * initialized here:
-     *
-     * - 'static_codes_loaded' must be initialized to false.
-     *
-     * - The first half of the main portion of each decode table must be
-     *   initialized to any value, to avoid reading from uninitialized
-     *   memory during table expansion in build_decode_table().  (Although,
-     *   this is really just to avoid warnings with dynamic tools like
-     *   valgrind, since build_decode_table() is guaranteed to initialize
-     *   all entries eventually anyway.)
-     *
-     * But for simplicity, we currently just zero the whole decompressor.
-     */
-    unsafe { MaybeUninit::<LibdeflateDecompressor>::zeroed().assume_init() }
+pub fn libdeflate_alloc_decode_tables() -> LibdeflateDecodeTables {
+    LibdeflateDecodeTables {
+        huffman_decode: HuffmanDecodeStruct {
+            lens: UncheckedArray::default(),
+            precode_lens: UncheckedArray::default(),
+            precode_decode_table: UncheckedArray::default(),
+            fast_temp_litlen: Vec::with_capacity(FAST_TABLESIZE),
+        },
+        litlen_decode_table: UncheckedArray::default(),
+        offset_decode_table: UncheckedArray::default(),
+        fast_decode_table: UncheckedArray::default(),
+
+        litlen_decode_subtable: UncheckedArray::default(),
+        offset_decode_subtable: UncheckedArray::default(),
+
+        sorted_syms: UncheckedArray::default(),
+        static_codes_loaded: false,
+    }
 }
 
 pub fn decompress_file_buffered(
@@ -133,15 +151,18 @@ pub fn decompress_file_buffered(
     func: impl FnMut(&[u8]) -> Result<(), ()>,
     buf_size: usize,
 ) -> Result<(), LibdeflateError> {
-    // let mut read_file = File::open(file).unwrap();
-
-    let mut input_stream = DeflateFileBufferInput::new(file.as_ref()); // |buf| read_file.read(buf).unwrap_or(0), buf_size);
+    let mut read_file = File::open(file).unwrap();
+    let mut input_stream =
+        DeflateChunkedBufferInput::new(|buf| read_file.read(buf).unwrap_or(0), buf_size);
 
     let mut output_stream = DeflateChunkedBufferOutput::new(func, buf_size);
 
-    let mut decompressor = libdeflate_alloc_decompressor();
+    let mut decompressor = libdeflate_alloc_decode_tables();
 
-    while input_stream.ensure_length(1) {
+    while {
+        input_stream.ensure_overread_length();
+        input_stream.has_valid_bytes_slow()
+    } {
         libdeflate_gzip_decompress(&mut decompressor, &mut input_stream, &mut output_stream)?;
     }
     Ok(())

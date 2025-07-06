@@ -27,9 +27,10 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-use crate::decompress_utils::libdeflate_deflate_decompress;
+use crate::decompress_deflate::decompress_fast;
 use crate::gzip_constants::*;
-use crate::{safety_check, DeflateInput, DeflateOutput, LibdeflateDecompressor, LibdeflateError};
+use crate::streams::deflate_chunked_buffer_input::DeflateChunkedBufferInput;
+use crate::{safety_check, DeflateInput, DeflateOutput, LibdeflateDecodeTables, LibdeflateError};
 
 // struct flush_buffer_data {
 // 	flush_buffer_func *user_func;
@@ -43,31 +44,34 @@ use crate::{safety_check, DeflateInput, DeflateOutput, LibdeflateDecompressor, L
 // 	return fdata->user_func(fdata->user_data, buffer, len);
 // }
 
-pub fn libdeflate_gzip_decompress<I: DeflateInput, O: DeflateOutput>(
-    d: &mut LibdeflateDecompressor,
-    in_stream: &mut I,
+pub fn libdeflate_gzip_decompress<O: DeflateOutput>(
+    d: &mut LibdeflateDecodeTables,
+    in_stream: &mut DeflateChunkedBufferInput,
     out_stream: &mut O,
 ) -> Result<(), LibdeflateError> {
     /* ID1 */
-    if in_stream.read_byte() != GZIP_ID1 {
+    if in_stream.read_byte::<true>() != GZIP_ID1 {
         return Err(LibdeflateError::BadData);
     }
     /* ID2 */
-    if in_stream.read_byte() != GZIP_ID2 {
+    if in_stream.read_byte::<true>() != GZIP_ID2 {
         return Err(LibdeflateError::BadData);
     }
     /* CM */
-    if in_stream.read_byte() != GZIP_CM_DEFLATE {
+    if in_stream.read_byte::<true>() != GZIP_CM_DEFLATE {
         return Err(LibdeflateError::BadData);
     }
-    let flg = in_stream.read_byte();
+    let flg = in_stream.read_byte::<true>();
 
     /* MTIME */
-    safety_check!(in_stream.move_stream_pos(4));
+    in_stream.move_stream_pos::<true>(4);
+    safety_check!(in_stream.has_valid_bytes_slow());
     /* XFL */
-    safety_check!(in_stream.move_stream_pos(1));
+    in_stream.move_stream_pos::<true>(1);
+    safety_check!(in_stream.has_valid_bytes_slow());
     /* OS */
-    safety_check!(in_stream.move_stream_pos(1));
+    in_stream.move_stream_pos::<true>(1);
+    safety_check!(in_stream.has_valid_bytes_slow());
 
     if (flg & GZIP_FRESERVED) != 0 {
         return Err(LibdeflateError::BadData);
@@ -75,33 +79,36 @@ pub fn libdeflate_gzip_decompress<I: DeflateInput, O: DeflateOutput>(
 
     /* Extra field */
     if (flg & GZIP_FEXTRA) != 0 {
-        let xlen = in_stream.read_le_u16();
-        safety_check!(in_stream.move_stream_pos(xlen as isize));
+        let xlen = in_stream.read_le_u16::<true>();
+        in_stream.move_stream_pos::<true>(xlen as isize);
+        safety_check!(in_stream.has_valid_bytes_slow());
     }
 
     /* Original file name (zero terminated) */
     if (flg & GZIP_FNAME) != 0 {
-        while in_stream.read_byte() != 0 {}
+        while in_stream.read_byte::<true>() != 0 {}
     }
 
     /* File comment (zero terminated) */
     if (flg & GZIP_FCOMMENT) != 0 {
-        while in_stream.read_byte() != 0 {}
+        while in_stream.read_byte::<true>() != 0 {}
     }
 
     /* CRC16 for gzip header */
     if (flg & GZIP_FHCRC) != 0 {
-        safety_check!(in_stream.move_stream_pos(2));
+        in_stream.move_stream_pos::<true>(2);
+        safety_check!(in_stream.has_valid_bytes_slow());
     }
 
     /* Compressed data  */
-    libdeflate_deflate_decompress(d, in_stream, out_stream)?;
+    // libdeflate_deflate_decompress(d, in_stream, out_stream)?;
+    decompress_fast(d, in_stream);
 
     let result = out_stream
         .final_flush()
         .map_err(|_| LibdeflateError::InsufficientSpace)?;
 
-    let gzip_crc = in_stream.read_le_u32();
+    let gzip_crc = in_stream.read_le_u32::<true>();
     if result.crc32 != gzip_crc {
         return Err(LibdeflateError::BadData);
     }

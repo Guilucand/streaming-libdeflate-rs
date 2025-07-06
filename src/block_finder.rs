@@ -213,7 +213,6 @@ impl BlockFinder {
         }
 
         // Process until the bit 122
-
         for i in (LAST_LITLEN_OFFSET..=122).step_by(3) {
             let result = self_.process_position(i);
             if let Some(position) = result {

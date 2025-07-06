@@ -4,6 +4,12 @@ use std::ops::{Index, IndexMut, Range};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UncheckedArray<T, const N: usize>(pub [T; N]);
 
+impl<T: Default + Copy, const N: usize> Default for UncheckedArray<T, N> {
+    fn default() -> Self {
+        Self([T::default(); N])
+    }
+}
+
 impl<T, const N: usize> UncheckedArray<T, N> {
     pub const fn from_array(array: [T; N]) -> Self {
         Self(array)
