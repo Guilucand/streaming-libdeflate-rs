@@ -175,7 +175,7 @@ mod tests {
     fn decompression_speed() {
         let context = Arc::new(AtomicUsize::new(0));
 
-        const PATH: &str = "/home/andrea/genome-assembly/data/salmonella-strains/strains-test";
+        const PATH: &str = "strains-test";
 
         let paths = std::fs::read_dir(PATH).unwrap();
         let mut paths_vec = Vec::new();

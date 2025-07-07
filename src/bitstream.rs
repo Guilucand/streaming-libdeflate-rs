@@ -227,9 +227,12 @@ mod tests {
                 .read_unaligned()
         }
 
-        fn move_stream_pos<const REFILL: bool>(&mut self, amount: isize) -> bool {
+        fn move_stream_pos<const REFILL: bool>(&mut self, amount: isize) {
             self.position = self.position.wrapping_add_signed(amount);
-            self.position < self.data.len()
+        }
+
+        fn get_stream_pos_mut(&mut self) -> &mut usize {
+            &mut self.position
         }
 
         fn tell_stream_pos(&self) -> usize {
@@ -252,6 +255,10 @@ mod tests {
             length: usize,
         ) -> bool {
             unimplemented!()
+        }
+
+        fn has_valid_bytes_slow(&mut self) -> bool {
+            true
         }
     }
 
