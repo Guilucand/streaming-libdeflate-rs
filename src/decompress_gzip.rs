@@ -100,21 +100,12 @@ pub fn libdeflate_gzip_decompress<O: DeflateOutput>(
         safety_check!(in_stream.has_valid_bytes_slow());
     }
 
-    let start = std::time::Instant::now();
-
     /* Compressed data  */
     libdeflate_deflate_decompress(d, in_stream, out_stream)?;
 
     let result = out_stream
         .final_flush()
         .map_err(|_| LibdeflateError::InsufficientSpace)?;
-
-    println!(
-        "Decompression completed successfully in {:?} with bytes: {} {:.2}MB/s",
-        start.elapsed(),
-        result.written,
-        result.written as f64 / 1024.0 / 1024.0 / start.elapsed().as_secs_f64()
-    );
 
     let gzip_crc = in_stream.read_le_u32::<true>();
     if result.crc32 != gzip_crc {

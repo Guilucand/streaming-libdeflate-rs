@@ -40,26 +40,26 @@ impl FastDecodeEntry {
     const MAX_LITERALS: u8 = 2;
 
     /// All the extra bits are embedded in the entry
-    pub const EXC_LEN_FULLSIZE: u8 = 0b00000001;
+    pub const EXC_LEN_FULLSIZE: u8 = 0b0000_0001;
 
     /// Needs len extra bits
-    pub const EXC_LEN_EXTRABIT: u8 = 0b00000010;
+    pub const EXC_LEN_EXTRABIT: u8 = 0b0000_0010;
 
     /// Needs a subtable to fully decode a litlen
-    pub const EXC_LEN_SUBTABLE: u8 = 0b00000011;
+    pub const EXC_LEN_SUBTABLE: u8 = 0b0000_0011;
 
     /// The length could be > 16 but is always <= 32
-    pub const EXC_BIGLEN32: u8 = 0b00100000;
+    pub const EXC_BIGLEN32: u8 = 0b0010_0000;
 
     /// The length could be larger than 32
-    pub const EXC_BIGLEN: u8 = 0b00010000;
+    pub const EXC_BIGLEN: u8 = 0b0001_0000;
 
-    /// The offset is too small to be copied, defaults to byte by byte copy
+    /// The offset is too small to be copied, defaults to copy with offset stride
     /// This constant should be EXC_BIGLEN32 | EXC_BIGLEN to allow byte by byte copy even if the len is large
-    pub const EXC_SMALLOFFSET: u8 = 0b00110000;
+    pub const EXC_SMALLOFFSET: u8 = 0b0011_0000;
 
     /// Is the end of a block
-    pub const EXC_END_OF_BLOCK: u8 = 0b00000111;
+    pub const EXC_END_OF_BLOCK: u8 = 0b0000_0111;
 
     pub const DEFAULT: FastDecodeEntry = FastDecodeEntry {
         bits: 0,

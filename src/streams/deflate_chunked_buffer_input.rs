@@ -1,4 +1,4 @@
-use crate::{decompress_utils::copy_word_unaligned, DeflateInput, DeflateOutput};
+use crate::{decompress_utils::copy_dword_unaligned, DeflateInput, DeflateOutput};
 use nightly_quirks::utils::NightlyUtils;
 use std::cmp::min;
 
@@ -146,8 +146,7 @@ impl<'a> DeflateInput for DeflateChunkedBufferInput<'a> {
                     .min(self.end_position - self.position);
                 let mut copyable = max_copyable as isize;
                 while copyable > 0 {
-                    copy_word_unaligned(src, dst);
-                    copy_word_unaligned(src.add(1), dst.add(1));
+                    copy_dword_unaligned(src, dst);
                     src = src.add(2);
                     dst = dst.add(2);
                     copyable -= 16;

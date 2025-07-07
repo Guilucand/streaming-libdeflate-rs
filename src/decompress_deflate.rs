@@ -131,43 +131,6 @@ pub(crate) struct HuffmanDecodeStruct {
     pub(crate) fast_temp_litlen: Vec<TempFastDecodeBuild>,
 }
 
-/*
- * This is the actual DEFLATE decompression routine, lifted out of
- * deflate_decompress.c so that it can be compiled multiple times with different
- * target instruction sets.
- */
-
-// #[inline(never)]
-// fn process_instructions<O: DeflateOutput>(
-//     instructions: &mut Vec<u16>,
-//     output_stream: &mut O,
-// ) -> Result<(), LibdeflateError> {
-//     // return Ok(());
-//     let mut instr_idx = 0;
-//     while instr_idx < instructions.len() {
-//         let instruction = instructions[instr_idx];
-
-//         if instruction & 0xFF00 == 0xFF00 {
-//             // Literal
-//             let literal = (instruction & 0x00FF) as u8;
-//             safety_check!(output_stream.write(&[literal]));
-//         } else {
-//             // Match
-//             let length = instruction as usize;
-//             instr_idx += 1; // Move to the next instruction for offset
-//             let offset = instructions[instr_idx] as usize;
-
-//             todo!();
-//             safety_check!(output_stream.copy_forward(offset, length));
-//         }
-
-//         instr_idx += 1;
-//     }
-
-//     instructions.clear();
-//     Ok(())
-// }
-
 #[inline(always)]
 fn process_entry<const COPY_ITERS: usize, const SINGLE_BYTES: bool, const VARLEN_COPY: bool>(
     state: DecodeEntryState,
@@ -184,37 +147,39 @@ fn process_entry<const COPY_ITERS: usize, const SINGLE_BYTES: bool, const VARLEN
         let length = state.entry.get_len_value() as usize;
 
         if SINGLE_BYTES {
-            // if offset == 1 {
-            //     /* RLE encoding of previous byte, common if the
-            //      * data contains many repeated bytes */
-            //     let v = usize::from_ne_bytes([*src; std::mem::size_of::<usize>()]);
+            if state.offset == 1 {
+                /* RLE encoding of previous byte, common if the
+                 * data contains many repeated bytes */
+                let v = u64::from_ne_bytes([*(src as *const u8); std::mem::size_of::<usize>()]);
 
-            //     std::ptr::write_unaligned(dst as *mut usize, v);
-            //     dst = dst.add(WORD_BYTES);
-            //     std::ptr::write_unaligned(dst as *mut usize, v);
-            //     dst = dst.add(WORD_BYTES);
-            //     loop {
-            //         std::ptr::write_unaligned(dst as *mut usize, v);
-            //         dst = dst.add(WORD_BYTES);
-            //         if dst as usize >= dst_end as usize {
-            //             break;
-            //         }
-            //     }
-            // }
+                std::ptr::write_unaligned(dst, v);
+                dst = dst.add(1);
+                std::ptr::write_unaligned(dst, v);
+                dst = dst.add(1);
+
+                let mut remaining = length as isize - 16;
+                while remaining > 0 {
+                    std::ptr::write_unaligned(dst, v);
+                    dst = dst.add(1);
+                    remaining -= 8;
+                }
+            }
 
             let mut remaining = length as isize;
             let mut src = src as *const u8;
             let mut dst = dst as *mut u8;
             loop {
-                for i in 0..8 {
-                    *dst.add(i) = *src.add(i);
-                }
-                remaining -= 8;
+                copy_word_unaligned(src as *const u64, dst as *mut u64);
+                src = src.add(state.offset);
+                dst = dst.add(state.offset);
+                copy_word_unaligned(src as *const u64, dst as *mut u64);
+                src = src.add(state.offset);
+                dst = dst.add(state.offset);
+
+                remaining -= (state.offset * 2) as isize;
                 if remaining <= 0 {
                     break;
                 }
-                src = src.add(8);
-                dst = dst.add(8);
             }
         } else if VARLEN_COPY {
             let mut remaining = length as isize;
@@ -252,34 +217,6 @@ fn set_next_entry<I: DeflateInput, const FAST: bool>(
     state: DecodeEntryState,
 ) {
     tmp_data.last_state = state;
-
-    // unsafe {
-    //     static mut TOT_FAST: usize = 0;
-    //     static mut TOT_SLOW: usize = 0;
-
-    //     if FAST {
-    //         TOT_FAST += 1;
-    //     }
-
-    //     if !FAST {
-    //         TOT_SLOW += 1;
-    //     }
-
-    //     static mut EXTRA_FAST: usize = 0;
-    //     static mut EXTRA_SLOW: usize = 0;
-    //     if FAST && state.entry.get_len_value() > 16 {
-    //         EXTRA_FAST += 1;
-    //     }
-    //     if !FAST && state.entry.get_len_value() > 16 {
-    //         EXTRA_SLOW += 1;
-    //     }
-    //     if TOT_FAST % 1000000 == 0 {
-    //         println!(
-    //             "Extra: SLOW: {}/{} FAST: {}/{}",
-    //             EXTRA_SLOW, TOT_SLOW, EXTRA_FAST, TOT_FAST
-    //         );
-    //     }
-    // }
 }
 
 #[inline(always)]
@@ -295,7 +232,20 @@ fn decode_block_instruction<I: DeflateInput, O: DeflateOutput, const FIRST_ENTRY
         tables.fast_decode_table[tmp_data.input_bitstream.bits(FAST_TABLEBITS) as usize];
 
     if !FIRST_ENTRY {
-        process_entry::<1, false, false>(tmp_data.last_state, output_stream);
+        match tmp_data.last_state.entry.get_copy_flags() {
+            FastDecodeEntry::EXC_SMALLOFFSET => {
+                process_entry::<0, true, false>(tmp_data.last_state, output_stream);
+            }
+            FastDecodeEntry::EXC_BIGLEN32 => {
+                process_entry::<2, false, false>(tmp_data.last_state, output_stream);
+            }
+            FastDecodeEntry::EXC_BIGLEN => {
+                process_entry::<0, false, true>(tmp_data.last_state, output_stream);
+            }
+            _ => {
+                process_entry::<1, false, false>(tmp_data.last_state, output_stream);
+            }
+        }
     }
 
     if likely(fast_entry.get_flags() == 0) {

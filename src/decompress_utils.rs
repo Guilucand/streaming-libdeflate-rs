@@ -59,6 +59,11 @@ pub unsafe fn copy_word_unaligned(src: *const u64, dst: *mut u64) {
     dst.write_unaligned(src.read_unaligned())
 }
 
+#[inline(always)]
+pub unsafe fn copy_dword_unaligned(src: *const u64, dst: *mut u64) {
+    (dst as *mut u128).write_unaligned((src as *const u128).read_unaligned())
+}
+
 /*****************************************************************************
  *                              Huffman decoding                             *
  *****************************************************************************/
