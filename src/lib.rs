@@ -76,6 +76,7 @@ pub trait DeflateInput {
 
     unsafe fn get_le_word_no_advance(&mut self) -> usize;
     fn move_stream_pos<const REFILL: bool>(&mut self, amount: isize);
+    fn get_stream_pos_mut(&mut self) -> &mut usize;
     fn tell_stream_pos(&self) -> usize;
     fn read<const REFILL: bool>(&mut self, out_data: &mut [u8]) -> usize;
     // Ensure that the current buffer has at least `Self::MAX_OVERREAD` elements. this function must never fail

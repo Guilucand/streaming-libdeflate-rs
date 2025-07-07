@@ -79,6 +79,11 @@ impl<'a> DeflateInput for DeflateChunkedBufferInput<'a> {
         self.position = self.position.wrapping_add_signed(amount);
     }
 
+    #[inline(always)]
+    fn get_stream_pos_mut(&mut self) -> &mut usize {
+        &mut self.position
+    }
+
     fn tell_stream_pos(&self) -> usize {
         self.global_position_offset + self.position
     }

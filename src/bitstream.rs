@@ -8,8 +8,6 @@ type BitBufType = usize;
 pub struct BitStream<'a, I: DeflateInput = DeflateChunkedBufferInput<'a>> {
     bitbuf: BitBufType,
     pub bitsleft: usize,
-    inbits_offset: usize,
-    // overrun_count: usize,
     pub input_stream: &'a mut I,
 }
 
@@ -20,7 +18,7 @@ pub struct BitStream<'a, I: DeflateInput = DeflateChunkedBufferInput<'a>> {
  * in FILL_BITS_WORDWISE() that leaves 'bitsleft' in the range
  * [WORDBITS - 8, WORDBITS - 1] rather than [WORDBITS - 7, WORDBITS].
  */
-const BITBUF_MAXBITS: usize = 8 * std::mem::size_of::<BitBufType>() - 8;
+const BITBUF_MAXBITS: usize = 8 * std::mem::size_of::<BitBufType>() - 1;
 
 /*
  * Evaluates to true if 'n' is a valid argument to ENSURE_BITS(n), or false if
@@ -40,22 +38,20 @@ pub const fn can_ensure(n: usize) -> bool {
  * only reads whole bytes from memory, so this is the lowest value of 'bitsleft'
  * at which another byte cannot be read without first consuming some bits.
  */
-pub const MAX_ENSURE: usize = BITBUF_MAXBITS;
+pub const MAX_ENSURE: usize = BITBUF_MAXBITS - 7;
 
 impl<'a, I: DeflateInput> BitStream<'a, I> {
     pub fn new(input_stream: &'a mut I) -> Self {
         Self {
             bitbuf: 0,
             bitsleft: 0,
-            inbits_offset: 0,
-            // overrun_count: 0,
             input_stream,
         }
     }
 
     #[inline(always)]
     pub fn bit_position(&self) -> usize {
-        self.input_stream.tell_stream_pos() * 8 + self.inbits_offset - (self.bitsleft as usize)
+        self.input_stream.tell_stream_pos() * 8 - (self.bitsleft as usize)
     }
 
     /*
@@ -85,31 +81,11 @@ impl<'a, I: DeflateInput> BitStream<'a, I> {
      */
     #[inline(always)]
     unsafe fn fill_bits_wordwise(&mut self) {
-        let bytes_to_read = BITBUF_MAXBITS - self.bitsleft;
-
-        // bitbuf:
-        // 000000000XXXXX => bytes_to_read == number of zeros
-
-        // input:
-        // XXXXXXXXXXX000 => inbits_offset == number of zeros
-        // new_word:
-        // 000XXXXXXXXXXX => inbits_offset == number of zeros
-        let new_word = self.input_stream.get_le_word_no_advance() >> self.inbits_offset;
-
-        // word_with_offset:
-        // XXXXXXXXX00000 => inbits_offset == number of zeros
-        let word_with_offset = new_word.wrapping_shl(self.bitsleft as u32);
-
-        // bitbuf:
-        // XXXXXXXXXXXXXX
-        self.bitbuf |= word_with_offset;
-        let new_offset = self.inbits_offset + bytes_to_read;
-
-        self.input_stream
-            .move_stream_pos::<false>((new_offset / 8) as isize);
-        self.inbits_offset = new_offset % 8;
-
-        self.bitsleft = BITBUF_MAXBITS;
+        self.bitbuf |= self.input_stream.get_le_word_no_advance() << (self.bitsleft as u8);
+        let in_next = self.input_stream.get_stream_pos_mut();
+        *in_next += size_of::<BitBufType>() - 1;
+        *in_next -= (self.bitsleft >> 3) & 0x7;
+        self.bitsleft |= BITBUF_MAXBITS & !7;
     }
 
     /*
@@ -199,19 +175,10 @@ impl<'a, I: DeflateInput> BitStream<'a, I> {
      */
     #[inline(always)]
     pub fn align_input(&mut self) -> Result<(), LibdeflateError> {
-        let mut delta = 0;
+        let bitsleft = self.bitsleft as u8;
 
-        let bitsleft = if self.inbits_offset > 0 {
-            delta += 1;
-            self.bitsleft + 8 - self.inbits_offset
-        } else {
-            self.bitsleft
-        } as isize;
-        delta -= bitsleft / 8;
-
-        self.input_stream.move_stream_pos::<true>(delta);
-
-        self.inbits_offset = 0;
+        self.input_stream
+            .move_stream_pos::<true>(-((bitsleft >> 3) as isize));
         self.bitbuf = 0;
         self.bitsleft = 0;
 
