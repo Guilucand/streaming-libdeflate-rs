@@ -48,12 +48,6 @@ impl FastDecodeEntry {
     /// Needs a subtable to fully decode a litlen
     pub const EXC_LEN_SUBTABLE: u8 = 0b0000_0011;
 
-    /// The length could be > 16 but is always <= 32
-    pub const EXC_BIGLEN32: u8 = 0b0010_0000;
-
-    /// The length could be larger than 32
-    pub const EXC_BIGLEN: u8 = 0b0001_0000;
-
     /// The offset is too small to be copied, defaults to copy with offset stride
     /// This constant should be EXC_BIGLEN32 | EXC_BIGLEN to allow byte by byte copy even if the len is large
     pub const EXC_SMALLOFFSET: u8 = 0b0011_0000;
@@ -69,16 +63,9 @@ impl FastDecodeEntry {
         off: 0,
     };
 
-    const fn compute_copy_flags(len: u16, extra_bits: u8) -> u8 {
-        let max_extra = (1 << extra_bits) - 1;
-        let max_len = len + max_extra;
-        if max_len <= 16 {
-            0
-        } else if max_len <= 32 {
-            Self::EXC_BIGLEN32
-        } else {
-            Self::EXC_BIGLEN
-        }
+    const fn compute_copy_flags(_len: u16, _extra_bits: u8) -> u8 {
+        // Not used anymore
+        0
     }
 
     const fn create_bits(offset_bits: u8, consumed_bits: u8) -> u8 {

@@ -51,7 +51,7 @@ pub struct DecompressTempData<'a, I: DeflateInput> {
     pub input_bitstream: BitStream<'a, I>,
     pub block_type: u32,
     pub is_final_block: bool,
-    pub last_state: DecodeEntryState,
+    pub fast_entry: FastDecodeEntry,
 }
 
 #[inline(always)]
