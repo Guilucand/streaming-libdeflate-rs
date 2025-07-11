@@ -414,6 +414,10 @@ pub(crate) fn libdeflate_deflate_decompress<I: DeflateInput, O: DeflateOutput>(
 
         init_block_instruction(&tables, &mut tmp_data);
 
+        // Max written in a loop iteration: 4 literals an 2 full length backcopies (258)
+        const MAX_WRITE: usize =
+            (DEFLATE_MAX_MATCH_LEN + (FastDecodeEntry::MAX_LITERALS as usize)) * 2;
+
         'main_loop: loop {
             tmp_data
                 .input_bitstream
@@ -424,14 +428,14 @@ pub(crate) fn libdeflate_deflate_decompress<I: DeflateInput, O: DeflateOutput>(
                 .input_bitstream
                 .input_stream
                 .has_readable_overread()
-                && out_stream.has_writable_length(DEFLATE_MAX_MATCH_LEN * 2)
+                && out_stream.has_writable_length(MAX_WRITE)
             {
                 if !decode_block_instruction::<_, _>(tables, &mut tmp_data, out_stream)? {
                     break 'main_loop;
                 }
             }
 
-            out_stream.flush_ensure_length(DEFLATE_MAX_MATCH_LEN * 2);
+            out_stream.flush_ensure_length(MAX_WRITE);
 
             // Invalid data or eof
             if !tmp_data.input_bitstream.input_stream.has_valid_bytes_slow() {

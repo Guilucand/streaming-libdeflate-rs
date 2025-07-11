@@ -545,7 +545,7 @@ pub fn build_fast_decode_table(
                 + index.new_entry.get_exceptional_length_bits() as usize;
             let used_bits = fast_entry.get_consumed_bits() as usize;
 
-            if used_bits + litlen_bits <= FAST_TABLEBITS {
+            if used_bits + litlen_bits <= FAST_TABLEBITS && !index.new_entry.is_subtable_pointer() {
                 let shifted_codeword = index.codeword >> used_bits;
 
                 if index.new_entry.has_literals() {

@@ -37,7 +37,7 @@ impl FastDecodeEntry {
     const CONSUMED_BITS_OFFSET: usize = 4;
     const LENGTH_OFFSET: usize = 4;
 
-    const MAX_LITERALS: u8 = 2;
+    pub const MAX_LITERALS: u8 = 2;
 
     /// All the extra bits are embedded in the entry
     pub const EXC_LEN_FULLSIZE: u8 = 0b0000_0001;
