@@ -570,7 +570,9 @@ pub fn build_fast_decode_table(
                         && !offset_entry.is_subtable_pointer()
                     {
                         // Only if we can match a full length + offset add it to the entry
-                        if !fast_entry.maybe_add_litlen_entry(index.new_entry, shifted_codeword) {
+                        if !fast_entry
+                            .maybe_add_litlen_entry(index.new_entry, index.codeword >> used_bits)
+                        {
                             return false;
                         }
                         fast_entry.add_offset_entry(offset_entry);
