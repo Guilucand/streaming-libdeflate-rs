@@ -37,13 +37,16 @@
  * corresponding ENOUGH number!
  */
 
-use crate::bitstream::BitStream;
-use crate::decode_blocks::decode_huffman_block;
+use crate::bitstream::{BitStream, BitStreamState};
+use crate::decode_blocks::{decode_huffman_block, DecodeBlockResult};
 use crate::decompress_utils::fast_decode_entry::FastDecodeEntry;
 use crate::decompress_utils::*;
 use crate::deflate_constants::*;
 use crate::unchecked::UncheckedArray;
-use crate::{DeflateInput, DeflateOutput, LibdeflateDecodeTables, LibdeflateError};
+use crate::{
+    DeflateInput, DeflateOutput, LibdeflateDecodeTables, LibdeflateDecompressResult,
+    LibdeflateError,
+};
 use nightly_quirks::branch_pred::likely;
 use nightly_quirks::branch_pred::unlikely;
 
@@ -383,71 +386,198 @@ fn decode_block_instruction<I: DeflateInput, O: DeflateOutput>(
     Ok(true)
 }
 
-#[inline(never)]
-pub(crate) fn libdeflate_deflate_decompress<I: DeflateInput, O: DeflateOutput>(
-    tables: &mut LibdeflateDecodeTables,
-    in_stream: &mut I,
-    out_stream: &mut O,
-) -> Result<(), LibdeflateError> {
-    let mut tmp_data = DecompressTempData {
-        is_final_block: false,
-        block_type: 0,
-        input_bitstream: BitStream::new(in_stream),
-        fast_entry: FastDecodeEntry::DEFAULT,
-    };
+const MAX_WRITE: usize = (DEFLATE_MAX_MATCH_LEN + (FastDecodeEntry::MAX_LITERALS as usize)) * 2;
 
-    'decompress_loop: loop {
-        if tmp_data.is_final_block {
-            break;
-        }
+const UNCOMPRESSED_COPY_CHUNK_SIZE: usize = 256;
 
-        /* Read the next huffman block */
-        if decode_huffman_block(tables, &mut tmp_data, out_stream)? {
-            // Decoded an uncompressed block
-            continue;
-        }
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum DeflateDecompressStage {
+    ReadBlockHeader,
+    HuffmanBody,
+    UncompressedBody,
+    Finish,
+    DrainOutput,
+    Done,
+}
 
-        tmp_data
-            .input_bitstream
-            .input_stream
-            .ensure_overread_length();
+pub struct LibdeflateDeflateDecompressor {
+    bitstream: BitStreamState,
+    is_final_block: bool,
+    block_type: u32,
+    fast_entry: FastDecodeEntry,
+    stage: DeflateDecompressStage,
+    uncompressed_remaining: usize,
+}
 
-        init_block_instruction(&tables, &mut tmp_data);
-
-        // Max written in a loop iteration: 4 literals an 2 full length backcopies (258)
-        const MAX_WRITE: usize =
-            (DEFLATE_MAX_MATCH_LEN + (FastDecodeEntry::MAX_LITERALS as usize)) * 2;
-
-        'main_loop: loop {
-            tmp_data
-                .input_bitstream
-                .input_stream
-                .ensure_overread_length();
-
-            while tmp_data
-                .input_bitstream
-                .input_stream
-                .has_readable_overread()
-                && out_stream.has_writable_length(MAX_WRITE)
-            {
-                if !decode_block_instruction::<_, _>(tables, &mut tmp_data, out_stream)? {
-                    break 'main_loop;
-                }
-            }
-
-            out_stream.flush_ensure_length(MAX_WRITE);
-
-            // Invalid data or eof
-            if !tmp_data.input_bitstream.input_stream.has_valid_bytes_slow() {
-                break 'decompress_loop;
-            }
+impl LibdeflateDeflateDecompressor {
+    pub fn new() -> Self {
+        Self {
+            bitstream: BitStreamState::default(),
+            is_final_block: false,
+            block_type: 0,
+            fast_entry: FastDecodeEntry::DEFAULT,
+            stage: DeflateDecompressStage::ReadBlockHeader,
+            uncompressed_remaining: 0,
         }
     }
 
-    /* That was the last block.  */
+    fn save_tmp_data<I: DeflateInput>(&mut self, tmp_data: &DecompressTempData<I>) {
+        self.bitstream = tmp_data.input_bitstream.save_state();
+        self.is_final_block = tmp_data.is_final_block;
+        self.block_type = tmp_data.block_type;
+        self.fast_entry = tmp_data.fast_entry;
+    }
 
-    /* Discard any readahead bits and check for excessive overread */
-    tmp_data.input_bitstream.align_input()?;
+    #[inline(never)]
+    pub fn decompress<I: DeflateInput, O: DeflateOutput>(
+        &mut self,
+        tables: &mut LibdeflateDecodeTables,
+        in_stream: &mut I,
+        out_stream: &mut O,
+    ) -> Result<LibdeflateDecompressResult, LibdeflateError> {
+        if self.stage == DeflateDecompressStage::Done {
+            return Ok(LibdeflateDecompressResult::EndOfStream);
+        }
 
-    Ok(())
+        let mut tmp_data = DecompressTempData {
+            is_final_block: self.is_final_block,
+            block_type: self.block_type,
+            input_bitstream: BitStream::from_state(in_stream, self.bitstream),
+            fast_entry: self.fast_entry,
+        };
+
+        loop {
+            match self.stage {
+                DeflateDecompressStage::ReadBlockHeader => {
+                    safety_check!(tmp_data.input_bitstream.input_stream.has_valid_bytes_slow());
+
+                    match decode_huffman_block(tables, &mut tmp_data, out_stream)? {
+                        DecodeBlockResult::Huffman => {
+                            self.is_final_block = tmp_data.is_final_block;
+                            self.block_type = tmp_data.block_type;
+                            tmp_data
+                                .input_bitstream
+                                .input_stream
+                                .ensure_overread_length();
+                            init_block_instruction(tables, &mut tmp_data);
+                            self.stage = DeflateDecompressStage::HuffmanBody;
+                        }
+                        DecodeBlockResult::Uncompressed { len } => {
+                            self.is_final_block = tmp_data.is_final_block;
+                            self.block_type = tmp_data.block_type;
+                            self.uncompressed_remaining = len;
+                            self.stage = DeflateDecompressStage::UncompressedBody;
+                        }
+                    }
+                }
+
+                DeflateDecompressStage::HuffmanBody => loop {
+                    tmp_data
+                        .input_bitstream
+                        .input_stream
+                        .ensure_overread_length();
+
+                    while tmp_data
+                        .input_bitstream
+                        .input_stream
+                        .has_readable_overread()
+                    {
+                        if !out_stream.has_writable_length(MAX_WRITE) {
+                            self.save_tmp_data(&tmp_data);
+                            return Ok(LibdeflateDecompressResult::MoreData);
+                        }
+
+                        if !decode_block_instruction::<_, _>(tables, &mut tmp_data, out_stream)? {
+                            self.stage = if tmp_data.is_final_block {
+                                DeflateDecompressStage::Finish
+                            } else {
+                                DeflateDecompressStage::ReadBlockHeader
+                            };
+                            break;
+                        }
+                    }
+
+                    if self.stage != DeflateDecompressStage::HuffmanBody {
+                        break;
+                    }
+
+                    if !out_stream.has_writable_length(MAX_WRITE) {
+                        self.save_tmp_data(&tmp_data);
+                        return Ok(LibdeflateDecompressResult::MoreData);
+                    }
+
+                    // Invalid data or eof.  Keep the previous behavior and let
+                    // final input alignment validate the stream boundary.
+                    if !tmp_data.input_bitstream.input_stream.has_valid_bytes_slow() {
+                        self.stage = DeflateDecompressStage::Finish;
+                        break;
+                    }
+                },
+
+                DeflateDecompressStage::UncompressedBody => {
+                    while self.uncompressed_remaining > 0 {
+                        if !out_stream.has_writable_length(UNCOMPRESSED_COPY_CHUNK_SIZE) {
+                            self.save_tmp_data(&tmp_data);
+                            return Ok(LibdeflateDecompressResult::MoreData);
+                        }
+
+                        tmp_data
+                            .input_bitstream
+                            .input_stream
+                            .ensure_overread_length();
+
+                        let copy_len = self
+                            .uncompressed_remaining
+                            .min(UNCOMPRESSED_COPY_CHUNK_SIZE);
+                        let out_ptr = out_stream.get_output_ptr();
+                        let out_slice =
+                            unsafe { std::slice::from_raw_parts_mut(out_ptr, copy_len) };
+                        let copied = tmp_data
+                            .input_bitstream
+                            .input_stream
+                            .read::<true>(out_slice);
+
+                        safety_check!(copied != 0);
+
+                        unsafe {
+                            out_stream.set_output_ptr(out_ptr.add(copied));
+                        }
+                        self.uncompressed_remaining -= copied;
+                    }
+
+                    self.stage = if self.is_final_block {
+                        DeflateDecompressStage::Finish
+                    } else {
+                        DeflateDecompressStage::ReadBlockHeader
+                    };
+                }
+
+                DeflateDecompressStage::Finish => {
+                    tmp_data.input_bitstream.align_input()?;
+                    self.save_tmp_data(&tmp_data);
+                    self.stage = DeflateDecompressStage::DrainOutput;
+                }
+
+                DeflateDecompressStage::DrainOutput => {
+                    self.save_tmp_data(&tmp_data);
+                    if !out_stream.pending_output().is_empty() {
+                        return Ok(LibdeflateDecompressResult::MoreData);
+                    }
+                    self.stage = DeflateDecompressStage::Done;
+                    return Ok(LibdeflateDecompressResult::EndOfStream);
+                }
+
+                DeflateDecompressStage::Done => {
+                    self.save_tmp_data(&tmp_data);
+                    return Ok(LibdeflateDecompressResult::EndOfStream);
+                }
+            }
+        }
+    }
+}
+
+impl Default for LibdeflateDeflateDecompressor {
+    fn default() -> Self {
+        Self::new()
+    }
 }

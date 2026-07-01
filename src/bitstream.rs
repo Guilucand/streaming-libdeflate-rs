@@ -1,9 +1,14 @@
 use crate::{
-    streams::deflate_chunked_buffer_input::DeflateChunkedBufferInput, DeflateInput, DeflateOutput,
-    LibdeflateError,
+    streams::deflate_chunked_buffer_input::DeflateChunkedBufferInput, DeflateInput, LibdeflateError,
 };
 
 type BitBufType = usize;
+
+#[derive(Copy, Clone, Default)]
+pub(crate) struct BitStreamState {
+    bitbuf: BitBufType,
+    bitsleft: usize,
+}
 
 pub struct BitStream<'a, I: DeflateInput = DeflateChunkedBufferInput<'a>> {
     bitbuf: BitBufType,
@@ -46,6 +51,21 @@ impl<'a, I: DeflateInput> BitStream<'a, I> {
             bitbuf: 0,
             bitsleft: 0,
             input_stream,
+        }
+    }
+
+    pub(crate) fn from_state(input_stream: &'a mut I, state: BitStreamState) -> Self {
+        Self {
+            bitbuf: state.bitbuf,
+            bitsleft: state.bitsleft,
+            input_stream,
+        }
+    }
+
+    pub(crate) fn save_state(&self) -> BitStreamState {
+        BitStreamState {
+            bitbuf: self.bitbuf,
+            bitsleft: self.bitsleft,
         }
     }
 
@@ -198,11 +218,6 @@ impl<'a, I: DeflateInput> BitStream<'a, I> {
         u16::from_le_bytes(bytes)
     }
 
-    #[inline(always)]
-    pub fn read_exact_into<O: DeflateOutput>(&mut self, out_stream: &mut O, length: usize) -> bool {
-        self.input_stream.read_exact_into(out_stream, length)
-    }
-
     // #[inline(always)]
     // pub fn has_overrun(&self) -> bool {
     //     self.overrun_count >= (size_of::<usize>() / 8)
@@ -248,14 +263,6 @@ mod tests {
         }
 
         fn ensure_overread_length(&mut self) {}
-
-        fn read_exact_into<O: crate::DeflateOutput>(
-            &mut self,
-            out_stream: &mut O,
-            length: usize,
-        ) -> bool {
-            unimplemented!()
-        }
 
         fn has_valid_bytes_slow(&mut self) -> bool {
             true

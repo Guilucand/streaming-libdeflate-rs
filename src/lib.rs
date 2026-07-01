@@ -18,7 +18,7 @@ use crate::decompress_deflate::{
     HuffmanDecodeStruct, OutStreamResult, FAST_TABLESIZE, LITLEN_SUBTABLESIZE, LITLEN_TABLESIZE,
     OFFSET_SUBTABLESIZE, OFFSET_TABLESIZE,
 };
-use crate::decompress_gzip::libdeflate_gzip_decompress;
+use crate::decompress_gzip::LibdeflateGzipDecompressor;
 use crate::decompress_utils::fast_decode_entry::FastDecodeEntry;
 use crate::deflate_constants::DEFLATE_MAX_NUM_SYMS;
 use crate::streams::deflate_chunked_buffer_input::DeflateChunkedBufferInput;
@@ -51,10 +51,7 @@ pub struct LibdeflateDecodeTables {
     pub(crate) static_codes_loaded: bool,
 }
 
-/*
- * Result of a call to libdeflate_deflate_decompress(),
- * libdeflate_zlib_decompress(), or libdeflate_gzip_decompress().
- */
+/* Result of a decompressor resume call. */
 #[derive(Debug)]
 pub enum LibdeflateError {
     /* Decompressed failed because the compressed data was invalid, corrupt,
@@ -68,6 +65,12 @@ pub enum LibdeflateError {
     /* The data would have decompressed to more than 'out_nbytes_avail'
      * bytes.  */
     InsufficientSpace = 3,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum LibdeflateDecompressResult {
+    MoreData,
+    EndOfStream,
 }
 
 pub trait DeflateInput {
@@ -84,8 +87,6 @@ pub trait DeflateInput {
     // Check if the stream buffer has at least Self::MAX_OVERREAD bytes remaining with either valid data or eof data
     fn has_readable_overread(&self) -> bool;
     fn has_valid_bytes_slow(&mut self) -> bool;
-    fn read_exact_into<O: DeflateOutput>(&mut self, out_stream: &mut O, length: usize) -> bool;
-
     #[inline(always)]
     fn read_byte<const REFILL: bool>(&mut self) -> u8 {
         let mut byte = [0];
@@ -113,12 +114,13 @@ pub trait DeflateOutput {
     const OVERWRITE_MAX: usize = 16;
 
     fn has_writable_length(&mut self, length: usize) -> bool;
-    fn flush_ensure_length(&mut self, length: usize) -> bool;
 
     fn get_output_ptr(&mut self) -> *mut u8;
     unsafe fn set_output_ptr(&mut self, ptr: *mut u8);
 
-    fn final_flush(&mut self) -> Result<OutStreamResult, ()>;
+    fn pending_output(&self) -> &[u8];
+    fn consume_output(&mut self);
+    fn finish_member(&mut self) -> Result<OutStreamResult, ()>;
 }
 
 pub fn libdeflate_alloc_decode_tables() -> LibdeflateDecodeTables {
@@ -143,14 +145,14 @@ pub fn libdeflate_alloc_decode_tables() -> LibdeflateDecodeTables {
 
 pub fn decompress_file_buffered(
     file: impl AsRef<Path>,
-    func: impl FnMut(&[u8]) -> Result<(), ()>,
+    mut func: impl FnMut(&[u8]) -> Result<(), ()>,
     buf_size: usize,
 ) -> Result<(), LibdeflateError> {
     let mut read_file = File::open(file).unwrap();
     let mut input_stream =
         DeflateChunkedBufferInput::new(|buf| read_file.read(buf).unwrap_or(0), buf_size);
 
-    let mut output_stream = DeflateChunkedBufferOutput::new(func, buf_size);
+    let mut output_stream = DeflateChunkedBufferOutput::new(buf_size);
 
     let mut decompressor = libdeflate_alloc_decode_tables();
 
@@ -158,18 +160,210 @@ pub fn decompress_file_buffered(
         input_stream.ensure_overread_length();
         input_stream.has_valid_bytes_slow()
     } {
-        libdeflate_gzip_decompress(&mut decompressor, &mut input_stream, &mut output_stream)?;
+        let mut gzip_decompressor = LibdeflateGzipDecompressor::new();
+
+        loop {
+            match gzip_decompressor.decompress(
+                &mut decompressor,
+                &mut input_stream,
+                &mut output_stream,
+            )? {
+                LibdeflateDecompressResult::MoreData => {
+                    func(output_stream.pending_output())
+                        .map_err(|_| LibdeflateError::InsufficientSpace)?;
+                    output_stream.consume_output();
+                }
+                LibdeflateDecompressResult::EndOfStream => break,
+            }
+        }
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::decompress_file_buffered;
+    use crate::decompress_deflate::LibdeflateDeflateDecompressor;
+    use crate::decompress_gzip::LibdeflateGzipDecompressor;
+    use crate::streams::deflate_chunked_buffer_input::DeflateChunkedBufferInput;
+    use crate::streams::deflate_chunked_buffer_output::DeflateChunkedBufferOutput;
+    use crate::{
+        decompress_file_buffered, libdeflate_alloc_decode_tables, DeflateOutput,
+        LibdeflateDecompressResult, LibdeflateError,
+    };
+    use crc32fast::Hasher;
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Instant;
+
+    fn stored_deflate_blocks(data: &[u8], block_size: usize) -> Vec<u8> {
+        let mut deflate = Vec::new();
+        let chunks_len = data.chunks(block_size).count().max(1);
+
+        for (index, chunk) in data.chunks(block_size).enumerate() {
+            deflate.push(if index + 1 == chunks_len { 1 } else { 0 });
+            let len = chunk.len() as u16;
+            deflate.extend_from_slice(&len.to_le_bytes());
+            deflate.extend_from_slice(&(!len).to_le_bytes());
+            deflate.extend_from_slice(chunk);
+        }
+
+        if data.is_empty() {
+            deflate.push(1);
+            deflate.extend_from_slice(&0u16.to_le_bytes());
+            deflate.extend_from_slice(&(!0u16).to_le_bytes());
+        }
+
+        deflate
+    }
+
+    fn gzip_stored(data: &[u8], block_size: usize) -> Vec<u8> {
+        let mut gzip = vec![0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 0xff];
+        gzip.extend_from_slice(&stored_deflate_blocks(data, block_size));
+
+        let mut hasher = Hasher::new();
+        hasher.update(data);
+        gzip.extend_from_slice(&hasher.finalize().to_le_bytes());
+        gzip.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        gzip
+    }
+
+    fn input_from_bytes<'a>(data: &'a [u8], buf_size: usize) -> DeflateChunkedBufferInput<'a> {
+        let mut position = 0;
+        DeflateChunkedBufferInput::new(
+            move |buf| {
+                let count = (data.len() - position).min(buf.len());
+                buf[..count].copy_from_slice(&data[position..position + count]);
+                position += count;
+                count
+            },
+            buf_size,
+        )
+    }
+
+    fn consume_output(output: &mut DeflateChunkedBufferOutput<'_>, decoded: &mut Vec<u8>) {
+        decoded.extend_from_slice(output.pending_output());
+        output.consume_output();
+    }
+
+    #[test]
+    fn gzip_decompress_returns_more_data_when_output_is_full() {
+        let data: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let gzip = gzip_stored(&data, 1024);
+        let mut input = input_from_bytes(&gzip, 1024);
+        let mut output = DeflateChunkedBufferOutput::new(300);
+        let mut tables = libdeflate_alloc_decode_tables();
+        let mut decompressor = LibdeflateGzipDecompressor::new();
+        let mut decoded = Vec::new();
+        let mut more_data_count = 0;
+
+        loop {
+            match decompressor
+                .decompress(&mut tables, &mut input, &mut output)
+                .unwrap()
+            {
+                LibdeflateDecompressResult::MoreData => {
+                    assert!(!output.pending_output().is_empty());
+                    more_data_count += 1;
+                    consume_output(&mut output, &mut decoded);
+                }
+                LibdeflateDecompressResult::EndOfStream => break,
+            }
+        }
+
+        assert!(more_data_count > 1);
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn deflate_resumes_inside_uncompressed_blocks() {
+        let data: Vec<u8> = (0..1500).map(|i| (255 - (i % 251)) as u8).collect();
+        let deflate = stored_deflate_blocks(&data, 1500);
+        let mut input = input_from_bytes(&deflate, 4096);
+        let mut output = DeflateChunkedBufferOutput::new(300);
+        let mut tables = libdeflate_alloc_decode_tables();
+        let mut decompressor = LibdeflateDeflateDecompressor::new();
+        let mut decoded = Vec::new();
+        let mut more_data_count = 0;
+
+        loop {
+            match decompressor
+                .decompress(&mut tables, &mut input, &mut output)
+                .unwrap()
+            {
+                LibdeflateDecompressResult::MoreData => {
+                    assert!(!output.pending_output().is_empty());
+                    more_data_count += 1;
+                    consume_output(&mut output, &mut decoded);
+                }
+                LibdeflateDecompressResult::EndOfStream => break,
+            }
+        }
+
+        assert!(more_data_count > 1);
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn gzip_bad_crc_is_reported_after_pending_output_is_consumed() {
+        let data = b"crc validation waits for final output";
+        let mut gzip = gzip_stored(data, 1024);
+        let crc_start = gzip.len() - 8;
+        gzip[crc_start] ^= 0x80;
+
+        let mut input = input_from_bytes(&gzip, 1024);
+        let mut output = DeflateChunkedBufferOutput::new(300);
+        let mut tables = libdeflate_alloc_decode_tables();
+        let mut decompressor = LibdeflateGzipDecompressor::new();
+        let mut decoded = Vec::new();
+        let mut saw_output = false;
+
+        loop {
+            match decompressor.decompress(&mut tables, &mut input, &mut output) {
+                Ok(LibdeflateDecompressResult::MoreData) => {
+                    saw_output = true;
+                    consume_output(&mut output, &mut decoded);
+                }
+                Ok(LibdeflateDecompressResult::EndOfStream) => {
+                    panic!("bad crc unexpectedly reached end of stream");
+                }
+                Err(LibdeflateError::BadData) => break,
+                Err(error) => panic!("unexpected error: {:?}", error),
+            }
+        }
+
+        assert!(saw_output);
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn decompress_file_buffered_reads_concatenated_gzip_members() {
+        let first = b"first gzip member";
+        let second = b"second gzip member";
+        let mut gzip = gzip_stored(first, 1024);
+        gzip.extend_from_slice(&gzip_stored(second, 1024));
+
+        let path = std::env::temp_dir().join(format!(
+            "streaming_libdeflate_concat_{}_{}.gz",
+            std::process::id(),
+            gzip.len()
+        ));
+        std::fs::write(&path, &gzip).unwrap();
+
+        let mut decoded = Vec::new();
+        let result = decompress_file_buffered(
+            &path,
+            |data| {
+                decoded.extend_from_slice(data);
+                Ok(())
+            },
+            300,
+        );
+        let _ = std::fs::remove_file(&path);
+
+        result.unwrap();
+        assert_eq!(decoded, [first.as_slice(), second.as_slice()].concat());
+    }
 
     #[test]
     fn decompression_speed() {

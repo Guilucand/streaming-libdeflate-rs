@@ -12,6 +12,11 @@ use crate::{
     safety_check, DeflateInput, DeflateOutput, LibdeflateDecodeTables, LibdeflateError,
 };
 
+pub enum DecodeBlockResult {
+    Huffman,
+    Uncompressed { len: usize },
+}
+
 #[inline(always)]
 pub fn decode_huffman_header_flags<I: DeflateInput>(tmp_data: &mut DecompressTempData<I>) {
     tmp_data.input_bitstream.force_ensure_bits_refill();
@@ -27,8 +32,8 @@ pub fn decode_huffman_header_flags<I: DeflateInput>(tmp_data: &mut DecompressTem
 pub fn decode_huffman_block<I: DeflateInput, O: DeflateOutput>(
     tables: &mut LibdeflateDecodeTables,
     tmp_data: &mut DecompressTempData<I>,
-    output: &mut O,
-) -> Result<bool, LibdeflateError> {
+    _output: &mut O,
+) -> Result<DecodeBlockResult, LibdeflateError> {
     /* Starting to read the next block.  */
     decode_huffman_header_flags(tmp_data);
 
@@ -39,8 +44,8 @@ pub fn decode_huffman_block<I: DeflateInput, O: DeflateOutput>(
     } else if tmp_data.block_type == DEFLATE_BLOCKTYPE_UNCOMPRESSED {
         /* Uncompressed block: copy 'len' bytes literally from the input
          * buffer to the output buffer.  */
-        decode_uncompressed_block(tmp_data, output)?;
-        return Ok(true);
+        let len = decode_uncompressed_block_header(tmp_data)?;
+        return Ok(DecodeBlockResult::Uncompressed { len });
     } else {
         safety_check!(tmp_data.block_type == DEFLATE_BLOCKTYPE_STATIC_HUFFMAN);
 
@@ -60,7 +65,7 @@ pub fn decode_huffman_block<I: DeflateInput, O: DeflateOutput>(
         }
     }
 
-    Ok(false)
+    Ok(DecodeBlockResult::Huffman)
 }
 
 #[inline(always)]
@@ -216,10 +221,9 @@ pub fn decode_dynamic_huffman_block<I: DeflateInput>(
 }
 
 #[inline(always)]
-pub fn decode_uncompressed_block<I: DeflateInput, O: DeflateOutput>(
+pub fn decode_uncompressed_block_header<I: DeflateInput>(
     tmp_data: &mut DecompressTempData<I>,
-    out_stream: &mut O,
-) -> Result<(), LibdeflateError> {
+) -> Result<usize, LibdeflateError> {
     tmp_data.input_bitstream.align_input()?;
 
     let len = unsafe { tmp_data.input_bitstream.read_u16() };
@@ -227,11 +231,7 @@ pub fn decode_uncompressed_block<I: DeflateInput, O: DeflateOutput>(
 
     safety_check!(len == !nlen);
 
-    tmp_data
-        .input_bitstream
-        .read_exact_into(out_stream, len as usize);
-
-    Ok(())
+    Ok(len as usize)
 }
 
 pub fn load_static_huffman_block(tables: &mut LibdeflateDecodeTables) {

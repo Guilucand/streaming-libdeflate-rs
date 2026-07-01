@@ -1,4 +1,4 @@
-use crate::{decompress_utils::copy_dword_unaligned, DeflateInput, DeflateOutput};
+use crate::DeflateInput;
 use nightly_quirks::utils::NightlyUtils;
 use std::cmp::min;
 
@@ -128,45 +128,5 @@ impl<'a> DeflateInput for DeflateChunkedBufferInput<'a> {
             self.refill_buffer();
         }
         self.position < self.end_position
-    }
-
-    #[inline(always)]
-    fn read_exact_into<O: DeflateOutput>(&mut self, out_stream: &mut O, mut length: usize) -> bool {
-        const CHUNK_SIZE: usize = 256;
-        unsafe {
-            while length > 0 {
-                out_stream.flush_ensure_length(CHUNK_SIZE);
-                self.ensure_overread_length();
-
-                let mut src = self.buffer.as_ptr().add(self.position) as *const u64;
-                let mut dst = out_stream.get_output_ptr() as *mut u64;
-
-                let max_copyable = length
-                    .min(CHUNK_SIZE)
-                    .min(self.end_position - self.position);
-                let mut copyable = max_copyable as isize;
-                while copyable > 0 {
-                    copy_dword_unaligned(src, dst);
-                    src = src.add(2);
-                    dst = dst.add(2);
-                    copyable -= 16;
-                }
-                length -= max_copyable - copyable.max(0) as usize;
-
-                let mut src = src as *mut u8;
-                let mut dst = dst as *mut u8;
-                if copyable < 0 {
-                    // Remove extra copied bytes
-                    src = src.sub(-copyable as usize);
-                    dst = dst.sub(-copyable as usize);
-                }
-
-                out_stream.set_output_ptr(dst);
-
-                self.position = src.offset_from(self.buffer.as_ptr()) as usize;
-            }
-        }
-
-        true
     }
 }

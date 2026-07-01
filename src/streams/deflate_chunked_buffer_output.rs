@@ -8,11 +8,11 @@ pub struct DeflateChunkedBufferOutput<'a> {
     current_ptr: *mut u8,
     crc32: Hasher,
     written: usize,
-    func: Box<dyn FnMut(&[u8]) -> Result<(), ()> + 'a>,
+    _marker: std::marker::PhantomData<&'a mut ()>,
 }
 
 impl<'a> DeflateChunkedBufferOutput<'a> {
-    pub fn new<F: FnMut(&[u8]) -> Result<(), ()> + 'a>(write_func: F, buf_size: usize) -> Self {
+    pub fn new(buf_size: usize) -> Self {
         unsafe {
             let mut buffer = NightlyUtils::box_new_uninit_slice_assume_init(
                 buf_size + Self::MAX_LOOK_BACK + Self::OVERWRITE_MAX,
@@ -26,19 +26,27 @@ impl<'a> DeflateChunkedBufferOutput<'a> {
                 current_ptr: buffer_start.add(Self::MAX_LOOK_BACK),
                 crc32: Hasher::new(),
                 written: 0,
-                func: Box::new(write_func),
+                _marker: std::marker::PhantomData,
             }
         }
     }
 
-    fn flush_buffer(&mut self) -> bool {
+    fn pending_end_index(&self) -> usize {
+        (unsafe { self.current_ptr.offset_from(self.buffer.as_ptr()) }) as usize
+    }
+
+    fn reset_output_ptr(&mut self) {
+        self.current_ptr = unsafe { self.buffer.as_mut_ptr().add(Self::MAX_LOOK_BACK) };
+    }
+
+    fn consume_buffer(&mut self) {
         let last_index = unsafe { self.current_ptr.offset_from(self.buffer.as_ptr()) } as usize;
+        if last_index == Self::MAX_LOOK_BACK {
+            return;
+        }
 
         self.crc32
             .update(&self.buffer[Self::MAX_LOOK_BACK..last_index]);
-        if (self.func)(&self.buffer[Self::MAX_LOOK_BACK..last_index]).is_err() {
-            return false;
-        }
         self.written += last_index - Self::MAX_LOOK_BACK;
 
         unsafe {
@@ -48,8 +56,7 @@ impl<'a> DeflateChunkedBufferOutput<'a> {
                 Self::MAX_LOOK_BACK,
             );
         }
-        self.current_ptr = unsafe { self.buffer.as_mut_ptr().add(Self::MAX_LOOK_BACK) };
-        true
+        self.reset_output_ptr();
     }
 }
 
@@ -57,15 +64,6 @@ impl<'a> DeflateOutput for DeflateChunkedBufferOutput<'a> {
     #[inline(always)]
     fn has_writable_length(&mut self, length: usize) -> bool {
         unsafe { self.current_ptr.add(length) <= self.last_usable_ptr }
-    }
-
-    fn flush_ensure_length(&mut self, length: usize) -> bool {
-        if !self.has_writable_length(length) {
-            if !self.flush_buffer() {
-                return false;
-            }
-        }
-        true
     }
 
     #[inline(always)]
@@ -104,10 +102,19 @@ impl<'a> DeflateOutput for DeflateChunkedBufferOutput<'a> {
     //     true
     // }
 
+    fn pending_output(&self) -> &[u8] {
+        &self.buffer[Self::MAX_LOOK_BACK..self.pending_end_index()]
+    }
+
+    fn consume_output(&mut self) {
+        self.consume_buffer();
+    }
+
     #[inline(always)]
-    fn final_flush(&mut self) -> Result<OutStreamResult, ()> {
-        self.flush_buffer();
-        self.current_ptr = unsafe { self.buffer.as_mut_ptr().add(Self::MAX_LOOK_BACK) };
+    fn finish_member(&mut self) -> Result<OutStreamResult, ()> {
+        if !self.pending_output().is_empty() {
+            return Err(());
+        }
 
         let result = OutStreamResult {
             written: self.written,
@@ -116,6 +123,7 @@ impl<'a> DeflateOutput for DeflateChunkedBufferOutput<'a> {
 
         self.crc32 = Hasher::new();
         self.written = 0;
+        self.reset_output_ptr();
         Ok(result)
     }
 }
