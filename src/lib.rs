@@ -16,7 +16,7 @@ extern crate static_assertions;
 
 use crate::decompress_deflate::{
     HuffmanDecodeStruct, OutStreamResult, FAST_TABLESIZE, LITLEN_SUBTABLESIZE, LITLEN_TABLESIZE,
-    OFFSET_SUBTABLESIZE, OFFSET_TABLESIZE,
+    MAX_WRITE, OFFSET_SUBTABLESIZE, OFFSET_TABLESIZE,
 };
 use crate::decompress_gzip::LibdeflateGzipDecompressor;
 use crate::decompress_utils::fast_decode_entry::FastDecodeEntry;
@@ -25,7 +25,7 @@ use crate::streams::deflate_chunked_buffer_input::DeflateChunkedBufferInput;
 use crate::streams::deflate_chunked_buffer_output::DeflateChunkedBufferOutput;
 use crate::unchecked::UncheckedArray;
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read};
 use std::mem::size_of;
 use std::path::Path;
 
@@ -51,7 +51,7 @@ pub struct LibdeflateDecodeTables {
     pub(crate) static_codes_loaded: bool,
 }
 
-/* Result of a decompressor resume call. */
+/* Error returned by a decompressor call. */
 #[derive(Debug)]
 pub enum LibdeflateError {
     /* Decompressed failed because the compressed data was invalid, corrupt,
@@ -67,6 +67,7 @@ pub enum LibdeflateError {
     InsufficientSpace = 3,
 }
 
+/* Result of a decompressor resume call. */
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum LibdeflateDecompressResult {
     MoreData,
@@ -119,7 +120,8 @@ pub trait DeflateOutput {
     unsafe fn set_output_ptr(&mut self, ptr: *mut u8);
 
     fn pending_output(&self) -> &[u8];
-    fn consume_output(&mut self);
+    fn consume_output(&mut self, consumed_offset: usize);
+    fn increase_buffer_size(&mut self, additional: usize);
     fn finish_member(&mut self) -> Result<OutStreamResult, ()>;
 }
 
@@ -143,41 +145,102 @@ pub fn libdeflate_alloc_decode_tables() -> LibdeflateDecodeTables {
     }
 }
 
-pub fn decompress_file_buffered(
+pub struct LibdeflateGzipFileDecompressor {
+    input_stream: DeflateChunkedBufferInput<'static>,
+    output_stream: DeflateChunkedBufferOutput<'static>,
+    decode_tables: LibdeflateDecodeTables,
+    gzip_decompressor: LibdeflateGzipDecompressor,
+    finished: bool,
+}
+
+impl LibdeflateGzipFileDecompressor {
+    pub fn new(file: impl AsRef<Path>, buf_size: usize) -> Self {
+        Self::try_new(file, buf_size).unwrap()
+    }
+
+    pub fn try_new(file: impl AsRef<Path>, buf_size: usize) -> io::Result<Self> {
+        let mut read_file = File::open(file)?;
+        let input_stream =
+            DeflateChunkedBufferInput::new(move |buf| read_file.read(buf).unwrap_or(0), buf_size);
+
+        Ok(Self {
+            input_stream,
+            output_stream: DeflateChunkedBufferOutput::new(buf_size),
+            decode_tables: libdeflate_alloc_decode_tables(),
+            gzip_decompressor: LibdeflateGzipDecompressor::new(),
+            finished: false,
+        })
+    }
+
+    pub fn decompress(&mut self) -> Result<LibdeflateDecompressResult, LibdeflateError> {
+        if self.finished {
+            if !self.output_stream.pending_output().is_empty() {
+                return Ok(LibdeflateDecompressResult::MoreData);
+            } else {
+                return Ok(LibdeflateDecompressResult::EndOfStream);
+            }
+        }
+
+        if !self.output_stream.has_writable_length(MAX_WRITE) {
+            return Ok(LibdeflateDecompressResult::MoreData);
+        }
+
+        loop {
+            match self.gzip_decompressor.decompress(
+                &mut self.decode_tables,
+                &mut self.input_stream,
+                &mut self.output_stream,
+            )? {
+                LibdeflateDecompressResult::MoreData => {
+                    return Ok(LibdeflateDecompressResult::MoreData);
+                }
+                LibdeflateDecompressResult::EndOfStream => {
+                    if !self.output_stream.pending_output().is_empty() {
+                        return Ok(LibdeflateDecompressResult::MoreData);
+                    }
+
+                    self.input_stream.ensure_overread_length();
+                    if !self.input_stream.has_valid_bytes_slow() {
+                        self.finished = true;
+                        return Ok(LibdeflateDecompressResult::EndOfStream);
+                    }
+
+                    self.gzip_decompressor = LibdeflateGzipDecompressor::new();
+                }
+            }
+        }
+    }
+
+    pub fn pending_output(&self) -> &[u8] {
+        self.output_stream.pending_output()
+    }
+
+    pub fn consume_output(&mut self, consumed_bytes: usize) {
+        self.output_stream.consume_output(consumed_bytes);
+    }
+
+    pub fn increase_buffer_size(&mut self, additional: usize) {
+        self.output_stream.increase_buffer_size(additional);
+    }
+}
+
+pub fn decompress_file_buffered_callback(
     file: impl AsRef<Path>,
     mut func: impl FnMut(&[u8]) -> Result<(), ()>,
     buf_size: usize,
 ) -> Result<(), LibdeflateError> {
-    let mut read_file = File::open(file).unwrap();
-    let mut input_stream =
-        DeflateChunkedBufferInput::new(|buf| read_file.read(buf).unwrap_or(0), buf_size);
+    let mut decompressor = LibdeflateGzipFileDecompressor::new(file, buf_size);
 
-    let mut output_stream = DeflateChunkedBufferOutput::new(buf_size);
-
-    let mut decompressor = libdeflate_alloc_decode_tables();
-
-    while {
-        input_stream.ensure_overread_length();
-        input_stream.has_valid_bytes_slow()
-    } {
-        let mut gzip_decompressor = LibdeflateGzipDecompressor::new();
-
-        loop {
-            match gzip_decompressor.decompress(
-                &mut decompressor,
-                &mut input_stream,
-                &mut output_stream,
-            )? {
-                LibdeflateDecompressResult::MoreData => {
-                    func(output_stream.pending_output())
-                        .map_err(|_| LibdeflateError::InsufficientSpace)?;
-                    output_stream.consume_output();
-                }
-                LibdeflateDecompressResult::EndOfStream => break,
+    loop {
+        match decompressor.decompress()? {
+            LibdeflateDecompressResult::MoreData => {
+                func(decompressor.pending_output())
+                    .map_err(|_| LibdeflateError::InsufficientSpace)?;
+                decompressor.consume_output(decompressor.pending_output().len());
             }
+            LibdeflateDecompressResult::EndOfStream => return Ok(()),
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -187,7 +250,7 @@ mod tests {
     use crate::streams::deflate_chunked_buffer_input::DeflateChunkedBufferInput;
     use crate::streams::deflate_chunked_buffer_output::DeflateChunkedBufferOutput;
     use crate::{
-        decompress_file_buffered, libdeflate_alloc_decode_tables, DeflateOutput,
+        decompress_file_buffered_callback, libdeflate_alloc_decode_tables, DeflateOutput,
         LibdeflateDecompressResult, LibdeflateError,
     };
     use crc32fast::Hasher;
@@ -351,7 +414,7 @@ mod tests {
         std::fs::write(&path, &gzip).unwrap();
 
         let mut decoded = Vec::new();
-        let result = decompress_file_buffered(
+        let result = decompress_file_buffered_callback(
             &path,
             |data| {
                 decoded.extend_from_slice(data);
@@ -385,7 +448,7 @@ mod tests {
         paths_vec.into_par_iter().for_each(|file| {
             let context = context.clone();
 
-            match decompress_file_buffered(
+            match decompress_file_buffered_callback(
                 &file,
                 |data| {
                     let mut rem = 0;

@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use streaming_libdeflate_rs::decompress_file_buffered;
+use streaming_libdeflate_rs::decompress_file_buffered_callback;
 use structopt::StructOpt;
 
 #[derive(StructOpt)]
@@ -16,7 +16,7 @@ fn main() {
     let params: GzipParams = GzipParams::from_args();
 
     if params.simulate {
-        decompress_file_buffered(params.input, move |_| Ok(()), 1024 * 512).unwrap();
+        decompress_file_buffered_callback(params.input, move |_| Ok(()), 1024 * 512).unwrap();
     } else {
         let mut write_file = BufWriter::new(
             File::create(
@@ -27,7 +27,7 @@ fn main() {
             .unwrap(),
         );
 
-        decompress_file_buffered(
+        decompress_file_buffered_callback(
             params.input,
             move |data| write_file.write_all(data).map_err(|_| ()),
             1024 * 512,

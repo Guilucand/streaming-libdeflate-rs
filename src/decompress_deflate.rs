@@ -386,7 +386,7 @@ fn decode_block_instruction<I: DeflateInput, O: DeflateOutput>(
     Ok(true)
 }
 
-const MAX_WRITE: usize = (DEFLATE_MAX_MATCH_LEN + (FastDecodeEntry::MAX_LITERALS as usize)) * 2;
+pub const MAX_WRITE: usize = (DEFLATE_MAX_MATCH_LEN + (FastDecodeEntry::MAX_LITERALS as usize)) * 2;
 
 const UNCOMPRESSED_COPY_CHUNK_SIZE: usize = 256;
 

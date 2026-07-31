@@ -1,6 +1,6 @@
 use crate::{DeflateOutput, OutStreamResult};
 use crc32fast::Hasher;
-use nightly_quirks::utils::NightlyUtils;
+use maligned::{align_first_boxed_default, A64};
 
 pub struct DeflateChunkedBufferOutput<'a> {
     buffer: Box<[u8]>,
@@ -14,7 +14,7 @@ pub struct DeflateChunkedBufferOutput<'a> {
 impl<'a> DeflateChunkedBufferOutput<'a> {
     pub fn new(buf_size: usize) -> Self {
         unsafe {
-            let mut buffer = NightlyUtils::box_new_uninit_slice_assume_init(
+            let mut buffer = align_first_boxed_default::<_, A64>(
                 buf_size + Self::MAX_LOOK_BACK + Self::OVERWRITE_MAX,
             );
 
@@ -39,24 +39,33 @@ impl<'a> DeflateChunkedBufferOutput<'a> {
         self.current_ptr = unsafe { self.buffer.as_mut_ptr().add(Self::MAX_LOOK_BACK) };
     }
 
-    fn consume_buffer(&mut self) {
+    fn consume_buffer(&mut self, consumed_offset: usize) {
         let last_index = unsafe { self.current_ptr.offset_from(self.buffer.as_ptr()) } as usize;
         if last_index == Self::MAX_LOOK_BACK {
             return;
         }
 
+        let consumed_index = Self::MAX_LOOK_BACK + consumed_offset;
+
         self.crc32
-            .update(&self.buffer[Self::MAX_LOOK_BACK..last_index]);
-        self.written += last_index - Self::MAX_LOOK_BACK;
+            .update(&self.buffer[Self::MAX_LOOK_BACK..consumed_index]);
+        self.written += consumed_index - Self::MAX_LOOK_BACK;
+
+        let remaining_bytes = last_index - consumed_index;
 
         unsafe {
             std::ptr::copy(
-                self.buffer.as_ptr().add(last_index - Self::MAX_LOOK_BACK),
+                self.buffer
+                    .as_ptr()
+                    .add(consumed_index - Self::MAX_LOOK_BACK),
                 self.buffer.as_mut_ptr(),
-                Self::MAX_LOOK_BACK,
+                Self::MAX_LOOK_BACK + remaining_bytes,
             );
+            self.current_ptr = self
+                .buffer
+                .as_mut_ptr()
+                .add(Self::MAX_LOOK_BACK + remaining_bytes);
         }
-        self.reset_output_ptr();
     }
 }
 
@@ -106,8 +115,25 @@ impl<'a> DeflateOutput for DeflateChunkedBufferOutput<'a> {
         &self.buffer[Self::MAX_LOOK_BACK..self.pending_end_index()]
     }
 
-    fn consume_output(&mut self) {
-        self.consume_buffer();
+    fn consume_output(&mut self, consumed_offset: usize) {
+        self.consume_buffer(consumed_offset);
+    }
+
+    fn increase_buffer_size(&mut self, additional: usize) {
+        let padded_additional = additional.next_multiple_of(64);
+        let mut new_buffer =
+            align_first_boxed_default::<u8, A64>(self.buffer.len() + padded_additional);
+        new_buffer[..self.pending_end_index()]
+            .copy_from_slice(&self.buffer[..self.pending_end_index()]);
+        unsafe {
+            self.current_ptr = new_buffer
+                .as_mut_ptr()
+                .offset(self.current_ptr.offset_from(self.buffer.as_ptr()));
+            self.last_usable_ptr = new_buffer
+                .as_mut_ptr()
+                .add(new_buffer.len() - Self::OVERWRITE_MAX);
+        }
+        self.buffer = new_buffer;
     }
 
     #[inline(always)]
