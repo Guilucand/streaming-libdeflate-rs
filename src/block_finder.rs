@@ -287,12 +287,31 @@ impl BlockFinder {
 mod tests {
     use std::io::{BufReader, Read, Seek, SeekFrom};
 
+    /// Scans a gzip file for deflate block boundaries.
+    ///
+    /// Needs a gzip file to scan, so it is ignored by default. Point
+    /// `STREAMING_LIBDEFLATE_TEST_GZ` at one to run it, and optionally set
+    /// `STREAMING_LIBDEFLATE_TEST_OFFSET` to start somewhere other than the file start.
     #[test]
+    #[ignore = "set STREAMING_LIBDEFLATE_TEST_GZ to a gzip file to run"]
     fn test_find_block() {
-        let mut file =
-            BufReader::new(std::fs::File::open("/data/ggcat/data/11SUR1QQSS11.fastq.gz").unwrap());
+        let path = match std::env::var_os("STREAMING_LIBDEFLATE_TEST_GZ") {
+            Some(path) => path,
+            None => {
+                eprintln!(
+                    "skipped: set STREAMING_LIBDEFLATE_TEST_GZ to a gzip file to run this test"
+                );
+                return;
+            }
+        };
+        let offset: u64 = match std::env::var("STREAMING_LIBDEFLATE_TEST_OFFSET") {
+            Ok(value) => value
+                .parse()
+                .expect("STREAMING_LIBDEFLATE_TEST_OFFSET must be a byte offset"),
+            Err(_) => 0,
+        };
 
-        let offset = 100000000;
+        let mut file = BufReader::new(std::fs::File::open(&path).unwrap());
 
         file.seek(SeekFrom::Start(offset)).unwrap();
 

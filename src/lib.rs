@@ -123,6 +123,18 @@ pub trait DeflateOutput {
     fn consume_output(&mut self, consumed_offset: usize);
     fn increase_buffer_size(&mut self, additional: usize);
     fn finish_member(&mut self) -> Result<OutStreamResult, ()>;
+
+    /// Whether `on_lz_copy` is called at all. Implementations that record matches set
+    /// this to true; the default keeps the copy loop identical to the unhooked one at
+    /// every optimisation level.
+    const TRACK_LZ: bool = false;
+
+    /// Called once for every LZ77 match right before it is copied (only when `TRACK_LZ`
+    /// is true), with `dst` the destination pointer (after the entry's literals),
+    /// `distance` the back-reference distance and `len` the match length. `len` is 0 for
+    /// literal-only entries.
+    #[inline(always)]
+    fn on_lz_copy(&mut self, _dst: *const u8, _distance: usize, _len: usize) {}
 }
 
 pub fn libdeflate_alloc_decode_tables() -> LibdeflateDecodeTables {
@@ -165,7 +177,9 @@ impl LibdeflateGzipFileDecompressor {
 
         Ok(Self {
             input_stream,
-            output_stream: DeflateChunkedBufferOutput::new(buf_size),
+            // The deflate loop only decodes while MAX_WRITE bytes are writable, so a
+            // smaller output buffer would never make progress.
+            output_stream: DeflateChunkedBufferOutput::new(buf_size.max(MAX_WRITE)),
             decode_tables: libdeflate_alloc_decode_tables(),
             gzip_decompressor: LibdeflateGzipDecompressor::new(),
             finished: false,
@@ -306,7 +320,8 @@ mod tests {
 
     fn consume_output(output: &mut DeflateChunkedBufferOutput<'_>, decoded: &mut Vec<u8>) {
         decoded.extend_from_slice(output.pending_output());
-        output.consume_output();
+        let pending = output.pending_output().len();
+        output.consume_output(pending);
     }
 
     #[test]
@@ -428,13 +443,27 @@ mod tests {
         assert_eq!(decoded, [first.as_slice(), second.as_slice()].concat());
     }
 
+    /// Decompression throughput over a directory of gzip files.
+    ///
+    /// Needs a corpus, so it is ignored by default. Point
+    /// `STREAMING_LIBDEFLATE_BENCH_DIR` at a directory of gzip files to run it.
     #[test]
+    #[ignore = "benchmark: set STREAMING_LIBDEFLATE_BENCH_DIR to a directory of gzip files to run"]
     fn decompression_speed() {
+        let dir = match std::env::var_os("STREAMING_LIBDEFLATE_BENCH_DIR") {
+            Some(dir) => dir,
+            None => {
+                eprintln!(
+                    "skipped: set STREAMING_LIBDEFLATE_BENCH_DIR to a directory of gzip files \
+                     to run this benchmark"
+                );
+                return;
+            }
+        };
+
         let context = Arc::new(AtomicUsize::new(0));
 
-        const PATH: &str = "strains-test";
-
-        let paths = std::fs::read_dir(PATH).unwrap();
+        let paths = std::fs::read_dir(&dir).unwrap();
         let mut paths_vec = Vec::new();
 
         for path in paths {

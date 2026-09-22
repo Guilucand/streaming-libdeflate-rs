@@ -134,9 +134,9 @@ pub(crate) struct HuffmanDecodeStruct {
 }
 
 #[inline(always)]
-fn process_entry<const SINGLE_BYTES: bool>(
+fn process_entry<const SINGLE_BYTES: bool, O: DeflateOutput>(
     state: DecodeEntryState,
-    output_stream: &mut impl DeflateOutput,
+    output_stream: &mut O,
 ) {
     unsafe {
         let mut out_ptr = output_stream.get_output_ptr();
@@ -147,6 +147,10 @@ fn process_entry<const SINGLE_BYTES: bool>(
         let mut dst = out_ptr as *mut u64;
 
         let length = state.entry.get_len_value() as usize;
+
+        if O::TRACK_LZ {
+            output_stream.on_lz_copy(out_ptr, state.offset, length);
+        }
 
         if SINGLE_BYTES {
             if state.offset == 1 {
@@ -248,7 +252,7 @@ fn decode_block_instruction<I: DeflateInput, O: DeflateOutput>(
         tmp_data.fast_entry =
             tables.fast_decode_table[tmp_data.input_bitstream.bits(FAST_TABLEBITS) as usize];
 
-        process_entry::<false>(state, output_stream);
+        process_entry::<false, _>(state, output_stream);
 
         if likely(tmp_data.fast_entry.get_flags() == 0) {
             let offset_bits = tmp_data.fast_entry.get_extra_offset_bits();
@@ -269,7 +273,7 @@ fn decode_block_instruction<I: DeflateInput, O: DeflateOutput>(
                 tables.fast_decode_table[tmp_data.input_bitstream.bits(FAST_TABLEBITS) as usize];
             tmp_data.input_bitstream.force_ensure_bits();
 
-            process_entry::<false>(state, output_stream);
+            process_entry::<false, _>(state, output_stream);
 
             return Ok(true);
         }
@@ -376,10 +380,10 @@ fn decode_block_instruction<I: DeflateInput, O: DeflateOutput>(
 
     match state.entry.get_copy_flags() {
         FastDecodeEntry::EXC_SMALLOFFSET => {
-            process_entry::<true>(state, output_stream);
+            process_entry::<true, _>(state, output_stream);
         }
         _ => {
-            process_entry::<false>(state, output_stream);
+            process_entry::<false, _>(state, output_stream);
         }
     }
 
